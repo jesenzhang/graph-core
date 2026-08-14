@@ -1,3 +1,5 @@
+//! Executable laboratory for small cross-structure experiments.
+
 use capability_graph::{Capability, CapabilityGraph};
 use execution_stream::{Sequence, StreamItem};
 use graph_core::Id;
