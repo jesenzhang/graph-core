@@ -1,0 +1,15 @@
+[package]
+name = "graph-lab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+capability-graph = { path = "../capability-graph" }
+execution-stream = { path = "../execution-stream" }
+graph-core = { path = "../core" }
+workflow-graph = { path = "../workflow-graph" }
+
+[lints]
+workspace = true
