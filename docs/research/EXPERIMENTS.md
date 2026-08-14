@@ -2,6 +2,18 @@
 
 Experiments should stay small, measurable, and disposable until a result justifies promotion into a stable crate API.
 
+## Status
+
+| Experiment | Status |
+|---|---|
+| E01 — Capability dependency resolution | PASS |
+| E02 — Scoped capability replacement | PASS |
+| E02R — Capability runtime integrity | PASS |
+| E02R-F1 — Scope hierarchy closure | PASS |
+| E03 — Versioned mutable workflow graph | PASS |
+| E04 — Crash/recovery boundary | NOT STARTED |
+| E05 — Typed stream backpressure | NOT STARTED |
+
 ## E01 — Capability dependency resolution
 
 Implement deterministic dependency resolution with cycle detection and explicit lifecycle order.
@@ -23,7 +35,7 @@ Acceptance:
 - replacement cleanup is deterministic;
 - failed replacement leaves the previous scope usable.
 
-## E03 — Mutable workflow revision
+## E03 — Mutable workflow revision — PASS
 
 Start a DAG, complete one task, then append a new branch selected by a mock planner.
 
@@ -32,6 +44,9 @@ Acceptance:
 - completed facts are immutable;
 - every topology change produces a monotonic revision;
 - replay can reconstruct the exact graph seen by each scheduling decision.
+
+Result: PASS. The implementation and evidence are recorded in
+[`E03-versioned-mutable-workflow-graph.md`](results/E03-versioned-mutable-workflow-graph.md).
 
 ## E04 — Crash/recovery boundary
 
