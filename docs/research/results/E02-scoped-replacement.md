@@ -5,6 +5,20 @@ English | [中文](E02-scoped-replacement.zh.md)
 Date: 2026-08-14
 Status: Complete
 
+## E02R follow-up
+
+E02 established scope inheritance, local shadowing, reader-owned \`Arc\`
+handles, and transactional replacement. E02R subsequently tightened the
+runtime integrity semantics exposed by that experiment: cleanup authority is
+runtime-owned, constructors receive exact dependency snapshots, candidate
+topologies cross the E01 resolver boundary, replacements use generations and
+exact entry identities, and teardown consumes dependency-aware ownership.
+
+The original E02 result remains a successful experiment. Its deferred
+questions were the next invariant surface, not evidence that the scope model
+failed. The follow-up result is recorded in
+[\`E02R-capability-runtime-integrity.md\`](E02R-capability-runtime-integrity.md).
+
 ## Research question
 
 Can a minimal parent/child scope model support inherited capabilities, local

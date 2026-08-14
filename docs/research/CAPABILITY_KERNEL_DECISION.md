@@ -3,7 +3,7 @@
 English | [中文](CAPABILITY_KERNEL_DECISION.zh.md)
 
 Date: 2026-08-14
-Evidence: E01, E02, and the current local Cordis/DeepSeek Harness source snapshots
+Evidence: E01, E02, E02R, and the current local Cordis/DeepSeek Harness source snapshots
 
 ## Decision
 
@@ -32,6 +32,46 @@ The detailed experiment records are:
 - [`E01-capability-resolution.md`](results/E01-capability-resolution.md)
 - [`E02-scoped-replacement.md`](results/E02-scoped-replacement.md)
 - [`CORDIS-CAPABILITY-RESEARCH.md`](CORDIS-CAPABILITY-RESEARCH.md)
+
+## E02R update
+
+E02R supports the existing YES, BUT NARROWER decision. It closes the runtime
+integrity gap without expanding graph-core into a general runtime. The
+follow-up record is [E02R capability runtime integrity](results/E02R-capability-runtime-integrity.md).
+
+- cleanup authority is held by runtime-owned slots, not reader handles;
+- constructors receive exact dependency snapshots that are retained by the
+  published entry;
+- runtime admission calls the E01 resolver for current definitions plus the
+  candidate;
+- replacements require an expected generation and preserve exact entry
+  identity;
+- teardown rejects new operations, follows dependency order, and relies on
+  Arc ownership for synchronous quiescence.
+
+The resulting v0 boundary is intentionally small:
+
+    capability identity
+    dependency declaration
+    deterministic resolution
+    cycle rejection
+    scoped visibility
+    exact runtime entry identity
+    reader-owned handles
+    dependency snapshots
+    transactional publication
+    generation conflict detection
+    ownership-safe cleanup
+    dependency-aware teardown
+
+The following remain outside the kernel boundary:
+
+    Agent, LLM, Tool, MCP, Workflow, Persistence
+    Distributed coordination, Plugin loader, Dynamic module loading
+    Config language, Event bus, HMR watcher, Async runtime
+
+E02R is a synchronous in-process proof. Async disposal, dependent restart,
+durability, and distributed ownership require independent evidence.
 
 ## 1. What belongs in graph-core
 
