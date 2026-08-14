@@ -3,7 +3,7 @@
 English | [中文](CAPABILITY_KERNEL_DECISION.zh.md)
 
 Date: 2026-08-14
-Evidence: E01, E02, E02R, and the current local Cordis/DeepSeek Harness source snapshots
+Evidence: E01, E02, E02R, E02R-F1, and the current local Cordis/DeepSeek Harness source snapshots
 
 ## Decision
 
@@ -63,6 +63,12 @@ The resulting v0 boundary is intentionally small:
     generation conflict detection
     ownership-safe cleanup
     dependency-aware teardown
+
+`Scope::teardown()` is the formal hierarchy lifecycle boundary for Capability
+Kernel v0. `Scope` is a cloneable handle, so `drop(scope)` is not equivalent
+to child-first, dependency-aware teardown. v0 does not add `ScopeOwner`, split
+`ScopeHandle`/owner types, or Drop-triggered automatic teardown; those are
+explicitly deferred ownership semantics.
 
 The following remain outside the kernel boundary:
 
@@ -166,13 +172,18 @@ not required to define capability ownership.
 
 E01/E02 are synchronous in-memory experiments. They do not establish:
 
-- how async resources drain while replacement or teardown is requested;
-- whether dependents should restart when a provider changes;
-- how concurrent replacements should resolve conflicts;
-- how dependency graph revisions interact with already-created instances;
-- whether named Runtime/Session/Task layers improve real applications;
-- how durability, replay, or distributed ownership should work.
+E02R has already closed expected-generation conflict semantics, including the
+structured `ReplacementConflict` result and a real two-thread stale
+replacement test. Those are no longer open research questions.
 
-Recommended next experiments are a versioned replacement conflict test, an
-async quiescence test, and a dependent-restart test. They should remain outside
-workflow scheduling and provider-specific code until their invariants are clear.
+The remaining Capability Kernel boundary is:
+
+- how async resources drain and reach quiescence during replacement or teardown;
+- dependent restart and rebind policy after a provider changes;
+- multi-capability transactional replacement;
+- durability;
+- distributed ownership;
+- production RAII owner semantics.
+
+These questions should remain outside workflow scheduling and provider-specific
+code until their invariants are clear.

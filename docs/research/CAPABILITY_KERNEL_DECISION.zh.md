@@ -3,7 +3,7 @@
 [English](CAPABILITY_KERNEL_DECISION.md) | 中文
 
 日期：2026-08-14
-证据：E01、E02，以及当前本地 Cordis/DeepSeek Harness 源码快照
+证据：E01、E02、E02R、E02R-F1，以及当前本地 Cordis/DeepSeek Harness 源码快照
 
 ## 决策
 
@@ -26,7 +26,28 @@ capability identity
 
 - [`E01-capability-resolution.zh.md`](results/E01-capability-resolution.zh.md)
 - [`E02-scoped-replacement.zh.md`](results/E02-scoped-replacement.zh.md)
+- [`E02R-capability-runtime-integrity.md`](results/E02R-capability-runtime-integrity.md)
 - [`CORDIS-CAPABILITY-RESEARCH.zh.md`](CORDIS-CAPABILITY-RESEARCH.zh.md)
+
+## E02R 更新
+
+E02R 支持现有的“是，但范围要更窄”决策，并补上 runtime integrity 边界：
+
+- cleanup authority 归 runtime-owned slot，而不是 reader handle；
+- constructor 接收并由已发布 entry 保留精确的 dependency snapshot；
+- runtime admission 使用 E01 resolver 检查当前 definition 与 candidate；
+- replacement 要求 expected generation，并保持精确的 entry identity；
+- teardown 拒绝新操作，按 dependency order 执行，并依赖 `Arc` ownership 实现同步 quiescence。
+
+v0 的正式边界仍然是同步、进程内的 capability kernel，不包含 Agent、LLM、Tool、MCP、Workflow、Persistence、distributed coordination、plugin loader、dynamic module loading、config language、event bus、HMR watcher 或 async runtime。
+
+`Scope::teardown()` 是 Capability Kernel v0 正式的 hierarchy lifecycle boundary。`Scope` 是 cloneable handle，因此：
+
+```text
+drop(scope)
+```
+
+不等价于 child-first、dependency-aware teardown。v0 暂不引入 `ScopeOwner`、`ScopeHandle` split 或 Drop auto teardown；这些属于尚未证明的 production RAII owner semantics。
 
 ## 1. 什么属于 graph-core
 
@@ -102,13 +123,15 @@ capability identity
 
 ## 5. 证据边界与下一步研究
 
-E01/E02 是同步、内存内实验，尚未证明：
+E01、E02、E02R 和 E02R-F1 是同步、内存内实验。E02R 已经完成 expected-generation conflict 语义，包括结构化 `ReplacementConflict` 结果和真实双线程 stale replacement 测试；这不再是开放问题。
 
-- replacement 或 teardown 请求到来时，异步 resource 如何 drain；
-- provider 变化时 dependent 是否应 restart；
-- 并发 replacement 如何解决 conflict；
-- dependency graph revision 如何影响已经创建的 instance；
-- named Runtime/Session/Task 层是否改善真实应用；
-- durability、replay 或 distributed ownership 应如何工作。
+Capability Kernel 仍有以下边界：
 
-推荐的下一步实验是：versioned replacement conflict、async quiescence 和 dependent-restart。它们的 invariants 明确之前，仍应避免引入 workflow scheduling 和 provider-specific code。
+- replacement 或 teardown 请求到来时，异步 resource 如何 drain 并达到 quiescence；
+- provider 变化后 dependent restart / rebind policy；
+- multi-capability transactional replacement；
+- durability；
+- distributed ownership；
+- production RAII owner semantics。
+
+这些问题的 invariants 明确之前，仍应避免引入 workflow scheduling 和 provider-specific code。
