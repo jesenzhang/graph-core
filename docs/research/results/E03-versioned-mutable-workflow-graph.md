@@ -46,6 +46,20 @@ Failed batches, empty batches, rejected cycles, completed-fact violations,
 unknown tasks, duplicate operations, and stale planner submissions do not
 advance the revision. Completion facts also do not advance it.
 
+## Revision Integrity
+
+`Revision` uses checked monotonic advancement. `Revision::checked_next()`
+returns `None` at `Revision::MAX`, while the existing `next()` API remains an
+explicit fail-fast operation rather than silently wrapping.
+
+When the topology revision is exhausted, `apply_batch()` returns the
+structured `RevisionExhausted` error. The rejected transition does not modify
+topology, execution facts, the mutation log, or the current revision.
+
+Replay uses the same checked transition. It rejects an exhausted revision and
+rejects records whose resulting revision is not the required next revision;
+neither case can produce a `MAX -> ZERO` wrap.
+
 ## Completed Fact Immutability
 
 Completed task identity is immutable. The v0 mutation surface intentionally
@@ -133,9 +147,32 @@ state has the same completed identities and the same deterministic
 `ready_tasks()` result as the original state. No universal event enum or event
 sourcing framework is introduced.
 
+### Replay Ordering Boundary
+
+Topology mutation log and completion fact log can be replayed separately in
+E03 v0 because the current mutation surface has these constraints:
+
+- task identity is immutable;
+- a completed task's prerequisite set is frozen;
+- topology mutation is append-only;
+- there is no `RemoveTask`, `RemoveDependency`, or `ReplaceTask` operation.
+
+Therefore the current replay order is:
+
+```text
+replay topology first
+then replay completion facts
+```
+
+This is sufficient to reconstruct the same scheduler view today. If a future
+experiment adds task/edge removal, task replacement, or historical topology
+rewrite, the cross-log ordering must be revalidated. It may require a global
+sequence or a completion record carrying its observed topology revision. E03-F1
+records this boundary but does not implement those operations.
+
 ## Experiment Results
 
-Focused workflow-graph validation covered 20 tests, including:
+Focused workflow-graph validation covered 23 tests, including:
 
 - successful and failed revision transitions;
 - one-revision batch commits and atomic cycle rejection;
@@ -145,6 +182,7 @@ Focused workflow-graph validation covered 20 tests, including:
 - all-or-nothing invalid batches;
 - stale planner revision conflict;
 - topology, revision, fact, and scheduler-view replay;
+- revision exhaustion and invalid replay-transition rejection;
 - deterministic ready-task queries and insertion-order stability.
 
 The graph-lab demonstration preserves the Capability Kernel smoke test and
@@ -179,8 +217,6 @@ shows the E03 transition from topology revision 1 to 2 with `plan` and
   journal.
 - No scheduler, worker, concurrent runtime, persistence, crash recovery, retry,
   or distributed ownership semantics are implemented.
-- Revision overflow and long-lived storage concerns are outside this small
-  standard-library experiment.
 
 ## Decision
 

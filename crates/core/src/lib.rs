@@ -53,6 +53,9 @@ impl Revision {
     /// Initial revision.
     pub const ZERO: Self = Self(0);
 
+    /// Largest representable revision.
+    pub const MAX: Self = Self(u64::MAX);
+
     /// Returns the raw revision value.
     #[must_use]
     pub const fn get(self) -> u64 {
@@ -62,7 +65,16 @@ impl Revision {
     /// Returns the next revision.
     #[must_use]
     pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+        self.checked_next().expect("revision overflow")
+    }
+
+    /// Returns the next revision, or None when the counter is exhausted.
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 
@@ -78,5 +90,11 @@ mod tests {
     #[test]
     fn revision_is_monotonic() {
         assert!(Revision::ZERO.next() > Revision::ZERO);
+    }
+
+    #[test]
+    fn revision_overflow_is_not_silent() {
+        assert_eq!(Revision::MAX.checked_next(), None);
+        assert!(std::panic::catch_unwind(|| Revision::MAX.next()).is_err());
     }
 }

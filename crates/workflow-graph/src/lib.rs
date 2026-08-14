@@ -414,8 +414,9 @@ impl WorkflowGraph {
     /// # Errors
     ///
     /// Returns [`WorkflowGraphError::RevisionConflict`] when the planner's
-    /// snapshot is stale. Other structured errors reject the candidate before
-    /// any part of the batch is committed.
+    /// snapshot is stale or [`WorkflowGraphError::RevisionExhausted`] when the
+    /// topology cannot advance. Other structured errors reject the candidate
+    /// before any part of the batch is committed.
     pub fn apply_batch<B>(
         &mut self,
         expected_revision: Revision,
@@ -436,6 +437,13 @@ impl WorkflowGraph {
             return Err(WorkflowGraphError::EmptyMutationBatch);
         }
 
+        let resulting_revision =
+            self.topology_revision
+                .checked_next()
+                .ok_or(WorkflowGraphError::RevisionExhausted {
+                    current: self.topology_revision,
+                })?;
+
         let mut candidate = self.clone();
         for mutation in batch.as_slice() {
             candidate.apply_mutation(mutation)?;
@@ -445,7 +453,6 @@ impl WorkflowGraph {
             return Err(WorkflowGraphError::Cycle { path });
         }
 
-        let resulting_revision = self.topology_revision.next();
         let record = WorkflowMutationRecord {
             base_revision: self.topology_revision,
             resulting_revision,
@@ -461,8 +468,15 @@ impl WorkflowGraph {
     ///
     /// Completion facts are intentionally not inferred from topology records;
     /// use [`Self::replay_with_facts`] when scheduler view must include them.
+    /// Exhausted or non-monotonic revision transitions are rejected.
     pub fn replay(records: &[WorkflowMutationRecord]) -> Result<Self, WorkflowGraphError> {
-        let mut graph = Self::default();
+        Self::replay_from(Self::default(), records)
+    }
+
+    fn replay_from(
+        mut graph: Self,
+        records: &[WorkflowMutationRecord],
+    ) -> Result<Self, WorkflowGraphError> {
         for record in records {
             if record.base_revision != graph.topology_revision {
                 return Err(WorkflowGraphError::RevisionConflict {
@@ -471,7 +485,11 @@ impl WorkflowGraph {
                 });
             }
 
-            let expected_result = graph.topology_revision.next();
+            let expected_result = graph.topology_revision.checked_next().ok_or(
+                WorkflowGraphError::RevisionExhausted {
+                    current: graph.topology_revision,
+                },
+            )?;
             if record.resulting_revision != expected_result {
                 return Err(WorkflowGraphError::ReplayRevisionMismatch {
                     expected: expected_result,
@@ -595,6 +613,11 @@ pub enum WorkflowGraphError {
     },
     /// A batch contained no topology transition.
     EmptyMutationBatch,
+    /// The topology revision cannot advance further.
+    RevisionExhausted {
+        /// Current exhausted topology revision.
+        current: Revision,
+    },
     /// A replay record's resulting revision was not the next revision.
     ReplayRevisionMismatch {
         /// Revision required by the replay sequence.
@@ -637,6 +660,11 @@ impl fmt::Display for WorkflowGraphError {
                 actual.get()
             ),
             Self::EmptyMutationBatch => f.write_str("workflow mutation batch is empty"),
+            Self::RevisionExhausted { current } => write!(
+                f,
+                "workflow topology revision exhausted at {}",
+                current.get()
+            ),
             Self::ReplayRevisionMismatch { expected, actual } => write!(
                 f,
                 "workflow replay revision mismatch: expected {}, record has {}",
@@ -679,6 +707,13 @@ mod tests {
         graph
             .apply_batch(graph.revision(), mutations)
             .expect("test mutation is valid");
+    }
+
+    fn graph_at_revision(revision: Revision) -> WorkflowGraph {
+        WorkflowGraph {
+            topology_revision: revision,
+            ..WorkflowGraph::default()
+        }
     }
 
     fn plan_research_execute() -> (WorkflowGraph, Id, Id, Id) {
@@ -735,6 +770,24 @@ mod tests {
         assert_eq!(record.mutations.len(), 2);
         assert_eq!(record.resulting_revision.get(), 1);
         assert_eq!(graph.revision().get(), 1);
+    }
+
+    #[test]
+    fn revision_exhaustion_does_not_mutate_workflow() {
+        let mut graph = graph_at_revision(Revision::MAX);
+        let before = graph.clone();
+
+        let error = graph
+            .apply_batch(Revision::MAX, [add_task("after-max")])
+            .expect_err("exhausted revision must reject a topology transition");
+
+        assert_eq!(
+            error,
+            WorkflowGraphError::RevisionExhausted {
+                current: Revision::MAX,
+            }
+        );
+        assert_eq!(graph, before);
     }
 
     #[test]
@@ -992,6 +1045,45 @@ mod tests {
         assert_eq!(replayed.revision(), graph.revision());
         assert_eq!(replayed.ready_tasks(), graph.ready_tasks());
         assert!(!replayed.ready_tasks().contains(&execute));
+    }
+
+    #[test]
+    fn replay_rejects_revision_overflow() {
+        let seed = graph_at_revision(Revision::MAX);
+        let record = WorkflowMutationRecord {
+            base_revision: Revision::MAX,
+            resulting_revision: Revision::MAX,
+            mutations: vec![add_task("after-max")],
+        };
+
+        let error = WorkflowGraph::replay_from(seed, &[record])
+            .expect_err("replay must reject an exhausted revision");
+
+        assert_eq!(
+            error,
+            WorkflowGraphError::RevisionExhausted {
+                current: Revision::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_replay_revision_does_not_wrap() {
+        let record = WorkflowMutationRecord {
+            base_revision: Revision::ZERO,
+            resulting_revision: Revision::ZERO,
+            mutations: vec![add_task("invalid")],
+        };
+
+        let error = WorkflowGraph::replay(&[record]).expect_err("invalid transition must reject");
+
+        assert_eq!(
+            error,
+            WorkflowGraphError::ReplayRevisionMismatch {
+                expected: Revision::ZERO.next(),
+                actual: Revision::ZERO,
+            }
+        );
     }
 
     #[test]
