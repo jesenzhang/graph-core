@@ -3,7 +3,7 @@
 use capability_graph::{Capability, CapabilityDefinition, CapabilityGraph, CapabilityValue, Scope};
 use execution_stream::{Sequence, StreamItem};
 use graph_core::Id;
-use workflow_graph::{Task, WorkflowGraph};
+use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_id = Id::new("model")?;
@@ -62,14 +62,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: Id::new("plan")?,
         label: "Plan work".to_owned(),
     };
+    let research = Task {
+        id: Id::new("research")?,
+        label: "Research work".to_owned(),
+    };
     let execute = Task {
         id: Id::new("execute")?,
         label: "Execute work".to_owned(),
     };
     let mut workflow = WorkflowGraph::default();
-    workflow.upsert_task(plan.clone());
-    workflow.upsert_task(execute.clone());
-    workflow.depends_on(&execute.id, &plan.id)?;
+    workflow.apply_batch(
+        workflow.revision(),
+        [
+            WorkflowMutation::AddTask { task: plan.clone() },
+            WorkflowMutation::AddTask {
+                task: research.clone(),
+            },
+            WorkflowMutation::AddTask {
+                task: execute.clone(),
+            },
+            WorkflowMutation::AddDependency {
+                task_id: research.id.clone(),
+                dependency_id: plan.id.clone(),
+            },
+            WorkflowMutation::AddDependency {
+                task_id: execute.id.clone(),
+                dependency_id: research.id.clone(),
+            },
+        ],
+    )?;
+    workflow.complete(&plan.id)?;
+    workflow.complete(&research.id)?;
+    let before_planner_revision = workflow.revision();
+    workflow.apply_batch(
+        before_planner_revision,
+        [
+            WorkflowMutation::AddTask {
+                task: Task {
+                    id: Id::new("validate")?,
+                    label: "Validate work".to_owned(),
+                },
+            },
+            WorkflowMutation::AddTask {
+                task: Task {
+                    id: Id::new("review")?,
+                    label: "Review work".to_owned(),
+                },
+            },
+            WorkflowMutation::AddDependency {
+                task_id: Id::new("validate")?,
+                dependency_id: research.id.clone(),
+            },
+            WorkflowMutation::AddDependency {
+                task_id: Id::new("review")?,
+                dependency_id: research.id.clone(),
+            },
+            WorkflowMutation::AddDependency {
+                task_id: execute.id.clone(),
+                dependency_id: Id::new("validate")?,
+            },
+            WorkflowMutation::AddDependency {
+                task_id: execute.id.clone(),
+                dependency_id: Id::new("review")?,
+            },
+        ],
+    )?;
+    let ready = workflow
+        .ready_tasks()
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
 
     let stream = StreamItem {
         stream_id: Id::new("runtime-events")?,
@@ -89,6 +152,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "e02r: {} -> replacement -> new lookup {}",
         old_service, new_model
+    );
+    println!(
+        "e03: topology_revision={} -> {}, completed=plan,research, ready={}",
+        before_planner_revision.get(),
+        workflow.revision().get(),
+        ready
     );
 
     drop(service);
