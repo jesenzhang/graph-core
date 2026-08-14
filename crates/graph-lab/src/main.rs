@@ -18,6 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kind: "runtime".to_owned(),
     });
     capabilities.require(&runtime_id, &model_id)?;
+    let resolution = capabilities.resolve()?;
+    let construction_order = resolution
+        .construction_order()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" -> ");
 
     let plan = Task {
         id: Id::new("plan")?,
@@ -39,8 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "capabilities={}, workflow_revision={}, stream={}#{}:{}",
+        "capabilities={}, construction_order={}, workflow_revision={}, stream={}#{}:{}",
         capabilities.len(),
+        construction_order,
         workflow.revision().get(),
         stream.stream_id,
         stream.sequence.get(),
