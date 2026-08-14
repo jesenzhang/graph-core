@@ -1,5 +1,7 @@
 # E02 — Scoped capability replacement
 
+English | [中文](E02-scoped-replacement.zh.md)
+
 Date: 2026-08-14
 Status: Complete
 

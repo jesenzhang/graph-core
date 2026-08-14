@@ -1,5 +1,7 @@
 # Capability kernel decision
 
+English | [中文](CAPABILITY_KERNEL_DECISION.zh.md)
+
 Date: 2026-08-14
 Evidence: E01, E02, and the current local Cordis/DeepSeek Harness source snapshots
 

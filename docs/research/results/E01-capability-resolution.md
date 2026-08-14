@@ -1,5 +1,7 @@
 # E01 — Capability dependency resolution
 
+English | [中文](E01-capability-resolution.zh.md)
+
 Date: 2026-08-14
 Status: Complete
 

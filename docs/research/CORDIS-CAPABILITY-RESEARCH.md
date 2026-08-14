@@ -1,5 +1,7 @@
 # Cordis Capability Research
 
+English | [中文](CORDIS-CAPABILITY-RESEARCH.zh.md)
+
 Snapshot taken on 2026-08-14 from the local checkouts you provided:
 
 - `F:\Workspace\cordis` @ `8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4` (`main...origin/main`, clean)
