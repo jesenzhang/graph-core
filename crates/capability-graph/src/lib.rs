@@ -103,7 +103,9 @@ mod tests {
         let model = capability("model");
         graph.insert(runtime.clone());
         graph.insert(model.clone());
-        graph.require(&runtime.id, &model.id).expect("edge is valid");
+        graph
+            .require(&runtime.id, &model.id)
+            .expect("edge is valid");
 
         assert_eq!(graph.requirements(&runtime.id), vec![&model.id]);
     }

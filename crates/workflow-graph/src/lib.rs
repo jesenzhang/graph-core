@@ -60,11 +60,7 @@ impl WorkflowGraph {
     /// Direct task dependencies in deterministic order.
     #[must_use]
     pub fn dependencies(&self, task: &Id) -> Vec<&Id> {
-        self.dependencies
-            .get(task)
-            .into_iter()
-            .flatten()
-            .collect()
+        self.dependencies.get(task).into_iter().flatten().collect()
     }
 }
 
