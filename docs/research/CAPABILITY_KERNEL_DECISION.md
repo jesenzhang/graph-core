@@ -147,6 +147,21 @@ not required to define capability ownership.
 - Last-reader disposal is a real ownership consequence, not just a testing
   convenience.
 
+### E02R-F1 scope hierarchy closure
+
+- An ancestor owns the lifetime of every descendant scope. Tearing down an
+  ancestor closes live descendants recursively, child-first; detached,
+  reparented, and orphaned scopes are not part of the v0 lifecycle model.
+- Existing handles remain valid through exact `Arc` dependency snapshots, and
+  dependent handles keep their dependencies alive until the dependent is
+  released. Closed descendants reject lookup and publication operations.
+- Teardown planning is an internal invariant: resolver failure is surfaced as
+  a panic rather than hidden by a map-order fallback. Logical capability
+  ordering remains separate from exact snapshot resource lifetime.
+- Generation and process-local entry identity allocation are checked for
+  exhaustion. The implementation is split into definition/resolver and
+  runtime modules behind a small `lib.rs` facade.
+
 ## 5. Evidence limits and next research
 
 E01/E02 are synchronous in-memory experiments. They do not establish:

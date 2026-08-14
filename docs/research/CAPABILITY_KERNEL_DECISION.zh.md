@@ -93,6 +93,13 @@ capability identity
 - 当 publication 独立成 commit step 时，construction failure 可以保留旧 value 不变。
 - Last-reader disposal 是真实的 ownership consequence，而不是测试技巧。
 
+## E02R-F1 Scope hierarchy closure / Scope 层级收口
+
+- 祖先 scope 拥有所有后代 scope 的生命周期。父级 teardown 会递归地、按最深层优先关闭仍然存活的后代；v0 不支持 detach、reparent 或 orphan。
+- 已存在的 handle 通过精确的 `Arc` dependency snapshot 继续有效；dependent handle 会保持依赖直到自身和其他 reader 都释放。已关闭的后代拒绝 lookup、validate、provide 与 replace。
+- teardown 规划把 resolver 失败视为内部不变量破坏，不再静默退回 map 顺序。逻辑 capability 顺序与精确 snapshot 的资源生命周期保持分离。
+- Generation 与进程内 EntryId 的耗尽都经过 checked 处理；实现拆分为 definition/resolver 与 runtime 模块，并由精简的 `lib.rs` facade 对外导出。
+
 ## 5. 证据边界与下一步研究
 
 E01/E02 是同步、内存内实验，尚未证明：

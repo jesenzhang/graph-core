@@ -210,9 +210,44 @@ and [Rust Drop documentation](https://doc.rust-lang.org/std/ops/trait.Drop.html)
   a separate experiment.
 - Scope teardown does not wait for an async task; it relies on reader and
   dependency handle ownership to keep synchronous resources valid.
-- Generation overflow and process restart persistence are not modeled.
+- Generation and entry-id exhaustion are checked; process-restart persistence
+  is not modeled.
 
 These limitations are explicit boundaries, not hidden runtime behavior.
+
+## Independent Review Follow-up — E02R-F1
+
+The follow-up closed the scope hierarchy lifetime gap: before this change,
+tearing down a parent closed only its local entries and could leave a child
+scope open even though the child could no longer resolve the parent's
+capabilities.
+
+The v0 lifecycle rule is now explicit: an ancestor owns the lifetime of every
+descendant. Parent teardown recursively transitions live descendants to
+`Closing` and then `Closed`, deepest scope first, before releasing their
+entries. There is no detach, reparent, or orphan state. Cleanup runs after the
+topology lock is released, so user cleanup cannot re-enter the topology while
+the hierarchy is being closed.
+
+Existing `CapabilityHandle` values remain valid through their exact `Arc`
+snapshots. A dependent entry keeps its dependency handles, so dependency
+cleanup waits until both the dependent and any independent in-flight reader
+release their handles. Closed descendants reject lookup, validation,
+provision, and replacement; creating a child from a closed parent produces a
+closed child under the existing infallible API.
+
+Teardown planning now treats a resolver failure as an internal invariant
+violation rather than silently falling back to map order. Runtime teardown
+keeps logical capability order separate from exact snapshot lifetime: the
+current published definition wins for a logical identifier, while recursively
+visited snapshot handles keep older generations alive until their owners drop.
+
+Generation and process-local entry identity allocation are checked. Generation
+exhaustion returns `ScopeError::GenerationExhausted`; entry-id exhaustion
+fails fast without wrapping. The oversized implementation was split into
+`definition.rs` and `runtime.rs`, with `lib.rs` retained as the public facade.
+
+Result: PASS.
 
 ## Decision
 
@@ -242,10 +277,10 @@ Config language, Event bus, HMR watcher, or Async runtime.
 
 Targeted capability-graph validation during this experiment:
 
-    30 passed; 0 failed
+    39 passed; 0 failed
 
 The required E02R semantic tests are in
-[crates/capability-graph/src/lib.rs](../../../crates/capability-graph/src/lib.rs),
+[crates/capability-graph](../../../crates/capability-graph/src/),
 including cleanup authority by API shape, runtime cycle admission, exact
 dependency generations, replacement conflicts, dependency-aware teardown,
 parent/child lifetime, and the two-thread race.
