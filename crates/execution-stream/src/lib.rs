@@ -374,7 +374,8 @@ pub struct KeyedStreamItem<K, T> {
     pub item: StreamItem<T>,
 }
 
-/// A fixed-capacity FIFO that replaces only pending items with the same key.
+/// A fixed-capacity FIFO that replaces only pending items with the same
+/// `(stream_id, key)` identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoalescingBuffer<K, T> {
     capacity: usize,
@@ -417,10 +418,10 @@ impl<K: Eq, T> CoalescingBuffer<K, T> {
 
     /// Attempts to add or replace one keyed pending item.
     ///
-    /// A matching key replaces its existing pending item and moves the newer
-    /// item to the pending queue's tail, preserving FIFO order among retained
-    /// keys. A new key at capacity returns the original item as explicit
-    /// backpressure.
+    /// A matching stream and key replaces its existing pending item and moves
+    /// the newer item to the pending queue's tail, preserving FIFO order
+    /// among retained identities. A new identity at capacity returns the
+    /// original item as explicit backpressure.
     ///
     /// # Errors
     ///
@@ -430,11 +431,9 @@ impl<K: Eq, T> CoalescingBuffer<K, T> {
         &mut self,
         item: KeyedStreamItem<K, T>,
     ) -> Result<(), PushError<KeyedStreamItem<K, T>>> {
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|existing| existing.key == item.key)
-        {
+        if let Some(index) = self.items.iter().position(|existing| {
+            existing.key == item.key && existing.item.stream_id == item.item.stream_id
+        }) {
             let _ = self.items.remove(index);
             self.items.push_back(item);
             return Ok(());
@@ -513,6 +512,31 @@ impl<T> LossyBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequencer_exhaustion_is_explicit() {
+        let stream_id = Id::new("test").expect("test id is valid");
+        let mut sequencer = StreamSequencer {
+            stream_id: stream_id.clone(),
+            next_sequence: Sequence::MAX,
+            exhausted: false,
+        };
+
+        assert_eq!(
+            sequencer
+                .emit(1_u8)
+                .expect("maximum sequence is valid")
+                .sequence,
+            Sequence::MAX
+        );
+        assert_eq!(
+            sequencer.emit(2_u8),
+            Err(SequenceError::Exhausted {
+                stream_id,
+                sequence: Sequence::MAX,
+            })
+        );
+    }
 
     #[test]
     fn payload_mapping_preserves_order_metadata() {

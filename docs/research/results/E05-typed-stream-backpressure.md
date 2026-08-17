@@ -1,7 +1,7 @@
 # E05 — Typed Stream Backpressure
 
 Date: 2026-08-17
-Status: Complete
+Status: Complete — integrity closure
 Decision: **PASS**
 
 ## Research Question
@@ -23,6 +23,14 @@ remain authoritative in their existing layers.
 The cross-structure tests deliberately drop and coalesce stream items while
 leaving workflow completion facts and topology revision unchanged. A lossy
 telemetry item is disposable and must never be the only copy of a durable fact.
+
+Integrity closure added after the initial experiment:
+
+- sequence emission at `u64::MAX` is followed by `SequenceError::Exhausted`
+  without wrapping;
+- coalescing identity includes `stream_id` as well as the semantic key;
+- replacing a pending key moves it to the pending tail, preserving the
+  documented multi-key ordering.
 
 ## Sequence Semantics
 

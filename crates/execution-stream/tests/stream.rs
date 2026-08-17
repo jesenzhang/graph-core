@@ -255,6 +255,50 @@ fn coalescing_delivery_gap_is_detectable() {
 }
 
 #[test]
+fn coalescing_identity_is_isolated_per_stream() {
+    let mut buffer = CoalescingBuffer::new(2).expect("capacity is valid");
+    let stream_a = id("stream-a");
+    let stream_b = id("stream-b");
+
+    buffer
+        .try_push(KeyedStreamItem {
+            key: "task-1",
+            item: StreamItem {
+                stream_id: stream_a.clone(),
+                sequence: Sequence::FIRST,
+                payload: 10_u32,
+            },
+        })
+        .expect("first stream fits");
+    buffer
+        .try_push(KeyedStreamItem {
+            key: "task-1",
+            item: StreamItem {
+                stream_id: stream_b.clone(),
+                sequence: Sequence::FIRST,
+                payload: 20_u32,
+            },
+        })
+        .expect("second stream has a distinct identity");
+
+    assert_eq!(buffer.pop().expect("stream a item").item.payload, 10);
+    assert_eq!(buffer.pop().expect("stream b item").item.payload, 20);
+}
+
+#[test]
+fn coalescing_same_key_moves_latest_item_to_pending_tail() {
+    let mut buffer = CoalescingBuffer::new(2).expect("capacity is valid");
+    buffer.try_push(keyed("A", 1, 10)).expect("space");
+    buffer.try_push(keyed("B", 2, 20)).expect("space");
+    buffer
+        .try_push(keyed("A", 3, 30))
+        .expect("same key coalesces");
+
+    assert_eq!(buffer.pop().expect("B remains first").key, "B");
+    assert_eq!(buffer.pop().expect("A moves to tail").item.payload, 30);
+}
+
+#[test]
 fn lossy_buffer_drops_oldest_when_full() {
     let mut buffer = LossyBuffer::new(2).expect("capacity is valid");
     buffer.push(item(1, 10));
