@@ -65,6 +65,31 @@ An idempotent retry keeps the same `OperationId` and may use a new
 `AttemptId`. The simulator deduplicates idempotent external commits by
 `OperationId`, never by a human-readable task label.
 
+## Effect Ownership Cardinality
+
+E04 v0 intentionally uses:
+
+```text
+TaskId -> 0..1 OperationId
+```
+
+because `WorkflowGraph` completion is task-level. Once an `EffectIntent` is
+durable, its `OperationId` owns exactly one workflow task. Multiple attempts
+remain allowed for the same `OperationId`.
+
+Multiple logical external operations per workflow task are not modeled. If
+production requires:
+
+```text
+Task -> multiple effects
+```
+
+future work must introduce explicit semantics such as a subtask per effect,
+an `EffectGroup`, or an operation-set completion rule before task completion
+can be derived safely. E04-F1 therefore rejects a second operation for the
+same task without replacing the existing owner or corrupting its recovery
+state.
+
 ## Idempotency Semantics
 
 `EffectSemantics::Idempotent` permits retrying an unknown outcome with the same

@@ -431,7 +431,11 @@ fn outcome_for_wrong_attempt_is_rejected() {
     let attempt_id = attempt("attempt-1");
     let mut journal = prepared_journal(&first_operation, EffectSemantics::NonIdempotent);
     journal
-        .persist_intent(intent(&second_operation, EffectSemantics::NonIdempotent))
+        .persist_intent(EffectIntent {
+            task_id: id("other-task"),
+            operation_id: second_operation.clone(),
+            semantics: EffectSemantics::NonIdempotent,
+        })
         .expect("second intent is valid");
     dispatch(&mut journal, &second_operation, &attempt_id);
 
@@ -479,6 +483,91 @@ fn conflicting_outcome_is_rejected() {
             attempted: KnownEffectOutcome::Failed,
         }
     );
+}
+
+#[test]
+fn second_operation_for_same_task_is_rejected() {
+    let first_operation = operation("send-contract/contract-123/v1");
+    let second_operation = operation("send-contract/contract-123/v2");
+    let mut journal = prepared_journal(&first_operation, EffectSemantics::NonIdempotent);
+    let before = journal.clone();
+
+    let error = journal
+        .persist_intent(intent(&second_operation, EffectSemantics::NonIdempotent))
+        .expect_err("one task cannot own two logical operations");
+
+    assert_eq!(
+        error,
+        JournalError::TaskOperationConflict {
+            task_id: id("send-contract"),
+            existing_operation: first_operation,
+            attempted_operation: second_operation,
+        }
+    );
+    assert_eq!(journal, before);
+}
+
+#[test]
+fn same_operation_can_have_multiple_attempts() {
+    let operation_id = operation("send-contract/contract-123/v1");
+    let first_attempt = attempt("attempt-1");
+    let second_attempt = attempt("attempt-2");
+    let mut journal = prepared_journal(&operation_id, EffectSemantics::Idempotent);
+
+    dispatch(&mut journal, &operation_id, &first_attempt);
+    dispatch(&mut journal, &operation_id, &second_attempt);
+
+    assert_eq!(
+        journal.state(&operation_id),
+        RecoveredEffectState::OutcomeUnknown
+    );
+    assert_eq!(
+        journal
+            .latest_dispatch(&operation_id)
+            .expect("latest attempt")
+            .attempt_id,
+        second_attempt
+    );
+}
+
+#[test]
+fn task_operation_conflict_does_not_corrupt_existing_recovery() {
+    let first_operation = operation("send-contract/contract-123/v1");
+    let second_operation = operation("send-contract/contract-123/v2");
+    let attempt_id = attempt("attempt-1");
+    let mut journal = prepared_journal(&first_operation, EffectSemantics::NonIdempotent);
+    dispatch(&mut journal, &first_operation, &attempt_id);
+
+    journal
+        .persist_intent(intent(&second_operation, EffectSemantics::NonIdempotent))
+        .expect_err("second operation must be rejected");
+
+    let decision = classify_recovery(&workflow_with_task(), &journal, &first_operation)
+        .expect("original operation remains known");
+    assert_eq!(decision.action, RecoveryAction::Reconcile);
+}
+
+#[test]
+fn known_success_has_unambiguous_task_completion_owner() {
+    let first_operation = operation("send-contract/contract-123/v1");
+    let second_operation = operation("send-contract/contract-123/v2");
+    let attempt_id = attempt("attempt-1");
+    let mut journal = prepared_journal(&first_operation, EffectSemantics::NonIdempotent);
+    dispatch(&mut journal, &first_operation, &attempt_id);
+    outcome(
+        &mut journal,
+        &first_operation,
+        &attempt_id,
+        KnownEffectOutcome::Succeeded,
+    );
+
+    journal
+        .persist_intent(intent(&second_operation, EffectSemantics::NonIdempotent))
+        .expect_err("a second owner cannot be admitted");
+    let decision = classify_recovery(&workflow_with_task(), &journal, &first_operation)
+        .expect("original operation remains known");
+
+    assert_eq!(decision.action, RecoveryAction::CompleteWithoutReexecution);
 }
 
 #[test]

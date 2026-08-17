@@ -31,6 +31,15 @@ pub enum JournalError {
     DuplicateIntent(OperationId),
     /// A dispatch was attempted without its intent.
     DispatchWithoutIntent(OperationId),
+    /// A task already owns a different logical external operation.
+    TaskOperationConflict {
+        /// Workflow task that already has an effect owner.
+        task_id: graph_core::Id,
+        /// Operation currently owning the task.
+        existing_operation: OperationId,
+        /// Operation that attempted to claim the task.
+        attempted_operation: OperationId,
+    },
     /// An attempt identity was already used.
     DuplicateAttempt {
         /// Operation attempting to reuse the attempt.
@@ -106,6 +115,15 @@ impl fmt::Display for JournalError {
             Self::DispatchWithoutIntent(operation_id) => {
                 write!(f, "dispatch without effect intent: {operation_id}")
             }
+            Self::TaskOperationConflict {
+                task_id,
+                existing_operation,
+                attempted_operation,
+            } => write!(
+                f,
+                "task {task_id} already belongs to operation {existing_operation}; \
+                 cannot assign {attempted_operation}"
+            ),
             Self::DuplicateAttempt {
                 operation_id,
                 attempt_id,
@@ -159,6 +177,7 @@ impl std::error::Error for JournalError {}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DurableJournal {
     intents: BTreeMap<OperationId, EffectIntent>,
+    task_operations: BTreeMap<graph_core::Id, OperationId>,
     dispatches: BTreeMap<AttemptId, DispatchRecord>,
     operation_attempts: BTreeMap<OperationId, Vec<AttemptId>>,
     outcomes: BTreeMap<AttemptId, OutcomeRecord>,
@@ -170,6 +189,7 @@ impl DurableJournal {
     pub const fn new() -> Self {
         Self {
             intents: BTreeMap::new(),
+            task_operations: BTreeMap::new(),
             dispatches: BTreeMap::new(),
             operation_attempts: BTreeMap::new(),
             outcomes: BTreeMap::new(),
@@ -180,11 +200,22 @@ impl DurableJournal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::DuplicateIntent`] when the operation already exists.
+    /// Returns [`JournalError::DuplicateIntent`] when the operation already
+    /// exists, or [`JournalError::TaskOperationConflict`] when the task is
+    /// already owned by another operation.
     pub fn persist_intent(&mut self, intent: EffectIntent) -> Result<(), JournalError> {
         if self.intents.contains_key(&intent.operation_id) {
             return Err(JournalError::DuplicateIntent(intent.operation_id));
         }
+        if let Some(existing_operation) = self.task_operations.get(&intent.task_id) {
+            return Err(JournalError::TaskOperationConflict {
+                task_id: intent.task_id,
+                existing_operation: existing_operation.clone(),
+                attempted_operation: intent.operation_id,
+            });
+        }
+        self.task_operations
+            .insert(intent.task_id.clone(), intent.operation_id.clone());
         self.intents.insert(intent.operation_id.clone(), intent);
         Ok(())
     }
