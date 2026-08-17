@@ -12,7 +12,7 @@ Experiments should stay small, measurable, and disposable until a result justifi
 | E02R-F1 — Scope hierarchy closure | PASS |
 | E03 — Versioned mutable workflow graph | PASS |
 | E04 — Crash/recovery boundary | PASS |
-| E05 — Typed stream backpressure | NOT STARTED |
+| E05 — Typed stream backpressure | PASS |
 
 ## E01 — Capability dependency resolution
 
@@ -66,7 +66,7 @@ simulator proves that a committed non-idempotent effect remains at one commit
 after a crash, while an idempotent retry also remains at one logical commit.
 See [`E04-crash-recovery-boundary.md`](results/E04-crash-recovery-boundary.md).
 
-## E05 — Typed stream backpressure
+## E05 — Typed stream backpressure — PASS
 
 Compare bounded lossless, bounded coalescing, and lossy telemetry channels.
 
@@ -75,6 +75,13 @@ Acceptance:
 - policy is declared per stream type;
 - sequence gaps are detectable when loss is allowed;
 - workflow state does not depend on a lossy stream.
+
+Result: PASS. `execution-stream` now provides explicit synchronous bounded
+lossless, same-key coalescing, and drop-oldest lossy policy types. Sequence
+overflow is checked, gaps and missing prefixes are observable, stream trackers
+are identity-bound, and cross-structure tests prove that dropping or
+coalescing runtime observations does not mutate workflow facts. See
+[`E05-typed-stream-backpressure.md`](results/E05-typed-stream-backpressure.md).
 
 ## Promotion rule
 

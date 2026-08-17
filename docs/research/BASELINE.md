@@ -1,7 +1,7 @@
 # Research Baseline
 
 Date: 2026-08-17
-Status: E01/E02/E02R/E02R-F1/E03/E04 research baseline; E05 not started
+Status: E01/E02/E02R/E02R-F1/E03/E04/E05 research baseline; initial three-structure research baseline complete
 
 ## Experiment status
 
@@ -13,7 +13,7 @@ Status: E01/E02/E02R/E02R-F1/E03/E04 research baseline; E05 not started
 | E02R-F1 — Scope hierarchy closure | PASS |
 | E03 — Versioned mutable workflow graph | PASS |
 | E04 — Crash/recovery boundary | PASS |
-| E05 — Typed stream backpressure | NOT STARTED |
+| E05 — Typed stream backpressure | PASS |
 
 ## 1. Research thesis
 
@@ -84,6 +84,12 @@ explicit, non-idempotent unknown outcomes require reconciliation, idempotent
 retries preserve `OperationId`, and known success completes execution facts
 without changing topology revision. See
 [`E04-crash-recovery-boundary.md`](results/E04-crash-recovery-boundary.md).
+
+E05 PASS establishes typed bounded transport policies for Execution Streams:
+lossless backpressure, same-key coalescing, and explicit lossy telemetry with
+sequence gap detection. Execution Streams remain non-authoritative for
+workflow correctness. See
+[`E05-typed-stream-backpressure.md`](results/E05-typed-stream-backpressure.md).
 
 ### 2.3 Execution Streams
 
