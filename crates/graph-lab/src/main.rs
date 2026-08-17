@@ -1,7 +1,10 @@
 //! Executable laboratory for small cross-structure experiments.
 
 use capability_graph::{Capability, CapabilityDefinition, CapabilityGraph, CapabilityValue, Scope};
-use execution_stream::{Sequence, StreamItem};
+use execution_stream::{
+    CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, Sequence,
+    SequenceObservation, SequenceTracker, StreamItem,
+};
 use graph_core::Id;
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{
@@ -193,6 +196,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "e04: non-idempotent outcome unknown -> {}, external_commits={external_commits}",
         decision.action
+    );
+
+    let stream_id = Id::new("e05-events")?;
+    let first = StreamItem {
+        stream_id: stream_id.clone(),
+        sequence: Sequence::FIRST,
+        payload: 10_u32,
+    };
+    let second = StreamItem {
+        stream_id: stream_id.clone(),
+        sequence: first.sequence.next(),
+        payload: 20_u32,
+    };
+    let mut lossless = LosslessBuffer::new(1)?;
+    lossless
+        .try_push(first.clone())
+        .expect("lossless setup has capacity");
+    let lossless_status = match lossless.try_push(second.clone()) {
+        Err(PushError::Backpressure(item)) => {
+            lossless.pop();
+            lossless
+                .try_push(item)
+                .expect("lossless retry has capacity");
+            "backpressured"
+        }
+        Ok(()) => "accepted",
+    };
+
+    let mut coalescing = CoalescingBuffer::new(1)?;
+    coalescing
+        .try_push(KeyedStreamItem {
+            key: "progress",
+            item: first.clone(),
+        })
+        .expect("coalescing setup has capacity");
+    coalescing
+        .try_push(KeyedStreamItem {
+            key: "progress",
+            item: second.clone(),
+        })
+        .expect("same key coalesces");
+    let coalesced = coalescing.pop().expect("coalesced item");
+    let mut coalescing_tracker = SequenceTracker::new(stream_id.clone());
+    let coalesced_gap = matches!(
+        coalescing_tracker.observe(&coalesced.item)?,
+        SequenceObservation::Gap { .. }
+    );
+
+    let mut lossy = LossyBuffer::new(1)?;
+    lossy.push(first);
+    lossy.push(second);
+    let telemetry = lossy.pop().expect("latest telemetry");
+    let mut telemetry_tracker = SequenceTracker::new(stream_id);
+    let telemetry_gap = matches!(
+        telemetry_tracker.observe(&telemetry)?,
+        SequenceObservation::Gap { .. }
+    );
+    println!(
+        "e05: lossless={lossless_status}, coalesced_gap={coalesced_gap}, telemetry_gap={telemetry_gap}"
     );
 
     drop(service);
