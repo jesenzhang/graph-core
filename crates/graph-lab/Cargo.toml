@@ -10,6 +10,7 @@ capability-graph = { path = "../capability-graph" }
 execution-stream = { path = "../execution-stream" }
 graph-core = { path = "../core" }
 workflow-graph = { path = "../workflow-graph" }
+workflow-recovery = { path = "../workflow-recovery" }
 
 [lints]
 workspace = true

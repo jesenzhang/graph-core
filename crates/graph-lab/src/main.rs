@@ -4,6 +4,10 @@ use capability_graph::{Capability, CapabilityDefinition, CapabilityGraph, Capabi
 use execution_stream::{Sequence, StreamItem};
 use graph_core::Id;
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
+use workflow_recovery::{
+    AttemptId, DispatchRecord, DurableJournal, EffectIntent, EffectSemantics, OperationId,
+    RecoveryAction, classify_recovery,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_id = Id::new("model")?;
@@ -158,6 +162,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         before_planner_revision.get(),
         workflow.revision().get(),
         ready
+    );
+
+    let effect_task = Id::new("send-contract")?;
+    let operation_id = OperationId::new("send-contract/contract-123/v1")?;
+    let attempt_id = AttemptId::new("attempt-1")?;
+    let mut recovery_workflow = WorkflowGraph::default();
+    recovery_workflow.apply_batch(
+        recovery_workflow.revision(),
+        [WorkflowMutation::AddTask {
+            task: Task {
+                id: effect_task,
+                label: "Send contract".to_owned(),
+            },
+        }],
+    )?;
+    let mut journal = DurableJournal::new();
+    journal.persist_intent(EffectIntent {
+        task_id: Id::new("send-contract")?,
+        operation_id: operation_id.clone(),
+        semantics: EffectSemantics::NonIdempotent,
+    })?;
+    journal.persist_dispatch(DispatchRecord {
+        operation_id: operation_id.clone(),
+        attempt_id,
+    })?;
+    let external_commits = 1;
+    let decision = classify_recovery(&recovery_workflow, &journal, &operation_id)?;
+    assert_eq!(decision.action, RecoveryAction::Reconcile);
+    println!(
+        "e04: non-idempotent outcome unknown -> {}, external_commits={external_commits}",
+        decision.action
     );
 
     drop(service);
