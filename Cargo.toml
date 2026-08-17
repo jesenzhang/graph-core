@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/capability-graph",
     "crates/workflow-graph",
+    "crates/workflow-recovery",
     "crates/execution-stream",
     "crates/graph-lab",
 ]

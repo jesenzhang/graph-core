@@ -28,6 +28,7 @@ dependencies = [
  "execution-stream",
  "graph-core",
  "workflow-graph",
+ "workflow-recovery",
 ]
 
 [[package]]
@@ -35,4 +36,12 @@ name = "workflow-graph"
 version = "0.1.0"
 dependencies = [
  "graph-core",
+]
+
+[[package]]
+name = "workflow-recovery"
+version = "0.1.0"
+dependencies = [
+ "graph-core",
+ "workflow-graph",
 ]

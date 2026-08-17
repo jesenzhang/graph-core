@@ -1,0 +1,323 @@
+//! In-memory durable fact model for the E04 experiment.
+
+use crate::model::{
+    AttemptId, DispatchRecord, EffectIntent, KnownEffectOutcome, OperationId, OutcomeRecord,
+    RecoveredEffectState,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+/// Structured invariant that rejects an impossible durable fact sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalInvariant {
+    /// A second dispatch was attempted after a known outcome was recorded.
+    DispatchAfterKnownOutcome {
+        /// Operation that already has a known outcome.
+        operation_id: OperationId,
+    },
+    /// More than one attempt was given a known outcome for one operation.
+    MultipleKnownOutcomes {
+        /// Operation with contradictory attempt outcomes.
+        operation_id: OperationId,
+    },
+}
+
+/// Error returned when a durable journal mutation would create malformed facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JournalError {
+    /// A query or outcome referenced an operation without a durable intent.
+    UnknownOperation(OperationId),
+    /// An operation intent can be persisted only once.
+    DuplicateIntent(OperationId),
+    /// A dispatch was attempted without its intent.
+    DispatchWithoutIntent(OperationId),
+    /// An attempt identity was already used.
+    DuplicateAttempt {
+        /// Operation attempting to reuse the attempt.
+        operation_id: OperationId,
+        /// Reused attempt identity.
+        attempt_id: AttemptId,
+    },
+    /// An outcome was recorded without a matching dispatch.
+    OutcomeWithoutDispatch {
+        /// Operation whose outcome was supplied.
+        operation_id: OperationId,
+        /// Attempt whose dispatch is missing.
+        attempt_id: AttemptId,
+    },
+    /// The attempt exists, but belongs to another operation.
+    AttemptMismatch {
+        /// Operation named by the outcome.
+        operation_id: OperationId,
+        /// Attempt named by the outcome.
+        attempt_id: AttemptId,
+        /// Operation that actually owns the attempt.
+        dispatched_for: OperationId,
+    },
+    /// The same attempt was assigned two different outcomes.
+    ConflictingOutcome {
+        /// Operation whose outcome conflicts.
+        operation_id: OperationId,
+        /// Attempt whose outcome conflicts.
+        attempt_id: AttemptId,
+        /// Previously recorded result.
+        existing: KnownEffectOutcome,
+        /// New contradictory result.
+        attempted: KnownEffectOutcome,
+    },
+    /// A durable mutation violated a journal invariant.
+    InvariantViolation(JournalInvariant),
+    /// Workflow completion and effect facts disagree.
+    WorkflowStateMismatch {
+        /// Operation associated with the mismatch.
+        operation_id: OperationId,
+        /// Task associated with the mismatch.
+        task_id: graph_core::Id,
+        /// Effect state observed at the boundary.
+        state: RecoveredEffectState,
+    },
+}
+
+impl fmt::Display for JournalInvariant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DispatchAfterKnownOutcome { operation_id } => {
+                write!(
+                    f,
+                    "dispatch after known outcome for operation {operation_id}"
+                )
+            }
+            Self::MultipleKnownOutcomes { operation_id } => {
+                write!(f, "multiple known outcomes for operation {operation_id}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for JournalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownOperation(operation_id) => {
+                write!(f, "unknown operation: {operation_id}")
+            }
+            Self::DuplicateIntent(operation_id) => {
+                write!(f, "duplicate effect intent: {operation_id}")
+            }
+            Self::DispatchWithoutIntent(operation_id) => {
+                write!(f, "dispatch without effect intent: {operation_id}")
+            }
+            Self::DuplicateAttempt {
+                operation_id,
+                attempt_id,
+            } => write!(
+                f,
+                "duplicate attempt {attempt_id} for operation {operation_id}"
+            ),
+            Self::OutcomeWithoutDispatch {
+                operation_id,
+                attempt_id,
+            } => write!(
+                f,
+                "outcome without dispatch: operation {operation_id}, attempt {attempt_id}"
+            ),
+            Self::AttemptMismatch {
+                operation_id,
+                attempt_id,
+                dispatched_for,
+            } => write!(
+                f,
+                "attempt {attempt_id} belongs to {dispatched_for}, not {operation_id}"
+            ),
+            Self::ConflictingOutcome {
+                operation_id,
+                attempt_id,
+                existing,
+                attempted,
+            } => write!(
+                f,
+                "conflicting outcome for operation {operation_id}, attempt {attempt_id}: "
+            )
+            .and_then(|_| write!(f, "{existing:?} versus {attempted:?}")),
+            Self::InvariantViolation(invariant) => {
+                write!(f, "journal invariant violation: {invariant}")
+            }
+            Self::WorkflowStateMismatch {
+                operation_id,
+                task_id,
+                state,
+            } => write!(
+                f,
+                "workflow state mismatch for operation {operation_id}, task {task_id}: {state:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JournalError {}
+
+/// Deterministic in-memory representation of durable local recovery facts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DurableJournal {
+    intents: BTreeMap<OperationId, EffectIntent>,
+    dispatches: BTreeMap<AttemptId, DispatchRecord>,
+    operation_attempts: BTreeMap<OperationId, Vec<AttemptId>>,
+    outcomes: BTreeMap<AttemptId, OutcomeRecord>,
+}
+
+impl DurableJournal {
+    /// Creates an empty durable journal.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            intents: BTreeMap::new(),
+            dispatches: BTreeMap::new(),
+            operation_attempts: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+        }
+    }
+
+    /// Persists one effect intent before any dispatch is allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::DuplicateIntent`] when the operation already exists.
+    pub fn persist_intent(&mut self, intent: EffectIntent) -> Result<(), JournalError> {
+        if self.intents.contains_key(&intent.operation_id) {
+            return Err(JournalError::DuplicateIntent(intent.operation_id));
+        }
+        self.intents.insert(intent.operation_id.clone(), intent);
+        Ok(())
+    }
+
+    /// Persists the dispatch boundary for one transport attempt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing intents, reused attempt identities, and dispatches after
+    /// a known outcome.
+    pub fn persist_dispatch(&mut self, dispatch: DispatchRecord) -> Result<(), JournalError> {
+        if !self.intents.contains_key(&dispatch.operation_id) {
+            return Err(JournalError::DispatchWithoutIntent(dispatch.operation_id));
+        }
+        if self.dispatches.contains_key(&dispatch.attempt_id) {
+            return Err(JournalError::DuplicateAttempt {
+                operation_id: dispatch.operation_id,
+                attempt_id: dispatch.attempt_id,
+            });
+        }
+        if self.known_outcome(&dispatch.operation_id).is_some() {
+            return Err(JournalError::InvariantViolation(
+                JournalInvariant::DispatchAfterKnownOutcome {
+                    operation_id: dispatch.operation_id,
+                },
+            ));
+        }
+
+        self.operation_attempts
+            .entry(dispatch.operation_id.clone())
+            .or_default()
+            .push(dispatch.attempt_id.clone());
+        self.dispatches
+            .insert(dispatch.attempt_id.clone(), dispatch);
+        Ok(())
+    }
+
+    /// Persists a known external outcome for a dispatched attempt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing intents, missing dispatches, attempt mismatches, and
+    /// contradictory outcomes.
+    pub fn persist_outcome(&mut self, outcome: OutcomeRecord) -> Result<(), JournalError> {
+        if !self.intents.contains_key(&outcome.operation_id) {
+            return Err(JournalError::UnknownOperation(outcome.operation_id));
+        }
+        let Some(dispatch) = self.dispatches.get(&outcome.attempt_id) else {
+            return Err(JournalError::OutcomeWithoutDispatch {
+                operation_id: outcome.operation_id,
+                attempt_id: outcome.attempt_id,
+            });
+        };
+        if dispatch.operation_id != outcome.operation_id {
+            return Err(JournalError::AttemptMismatch {
+                operation_id: outcome.operation_id,
+                attempt_id: outcome.attempt_id,
+                dispatched_for: dispatch.operation_id.clone(),
+            });
+        }
+
+        if let Some(existing) = self.outcomes.get(&outcome.attempt_id) {
+            if existing.outcome == outcome.outcome {
+                return Ok(());
+            }
+            return Err(JournalError::ConflictingOutcome {
+                operation_id: outcome.operation_id,
+                attempt_id: outcome.attempt_id,
+                existing: existing.outcome,
+                attempted: outcome.outcome,
+            });
+        }
+        if self.known_outcome(&outcome.operation_id).is_some() {
+            return Err(JournalError::InvariantViolation(
+                JournalInvariant::MultipleKnownOutcomes {
+                    operation_id: outcome.operation_id,
+                },
+            ));
+        }
+
+        self.outcomes.insert(outcome.attempt_id.clone(), outcome);
+        Ok(())
+    }
+
+    /// Returns the intent for an operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::UnknownOperation`] when no intent exists.
+    pub fn intent(&self, operation_id: &OperationId) -> Result<&EffectIntent, JournalError> {
+        self.intents
+            .get(operation_id)
+            .ok_or_else(|| JournalError::UnknownOperation(operation_id.clone()))
+    }
+
+    /// Returns the most recently persisted dispatch for an operation.
+    #[must_use]
+    pub fn latest_dispatch(&self, operation_id: &OperationId) -> Option<&DispatchRecord> {
+        self.operation_attempts
+            .get(operation_id)
+            .and_then(|attempts| attempts.last())
+            .and_then(|attempt_id| self.dispatches.get(attempt_id))
+    }
+
+    /// Returns the known outcome for an operation, if one has been checkpointed.
+    #[must_use]
+    pub fn known_outcome(&self, operation_id: &OperationId) -> Option<&OutcomeRecord> {
+        self.operation_attempts
+            .get(operation_id)
+            .into_iter()
+            .flatten()
+            .find_map(|attempt_id| self.outcomes.get(attempt_id))
+    }
+
+    /// Derives local recovery knowledge from durable facts only.
+    #[must_use]
+    pub fn state(&self, operation_id: &OperationId) -> RecoveredEffectState {
+        if !self.intents.contains_key(operation_id) {
+            return RecoveredEffectState::NotPrepared;
+        }
+        if let Some(outcome) = self.known_outcome(operation_id) {
+            return RecoveredEffectState::OutcomeKnown(outcome.outcome);
+        }
+        if self.latest_dispatch(operation_id).is_some() {
+            RecoveredEffectState::OutcomeUnknown
+        } else {
+            RecoveredEffectState::Prepared
+        }
+    }
+
+    /// Returns all operation identities in deterministic order.
+    #[must_use]
+    pub fn operation_ids(&self) -> BTreeSet<OperationId> {
+        self.intents.keys().cloned().collect()
+    }
+}

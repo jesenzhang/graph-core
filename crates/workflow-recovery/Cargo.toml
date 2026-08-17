@@ -1,0 +1,13 @@
+[package]
+name = "workflow-recovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+graph-core = { path = "../core" }
+workflow-graph = { path = "../workflow-graph" }
+
+[lints]
+workspace = true
