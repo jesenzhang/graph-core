@@ -11,7 +11,7 @@ Experiments should stay small, measurable, and disposable until a result justifi
 | E02R — Capability runtime integrity | PASS |
 | E02R-F1 — Scope hierarchy closure | PASS |
 | E03 — Versioned mutable workflow graph | PASS |
-| E04 — Crash/recovery boundary | NOT STARTED |
+| E04 — Crash/recovery boundary | PASS |
 | E05 — Typed stream backpressure | NOT STARTED |
 
 ## E01 — Capability dependency resolution
@@ -48,7 +48,7 @@ Acceptance:
 Result: PASS. The implementation and evidence are recorded in
 [`E03-versioned-mutable-workflow-graph.md`](results/E03-versioned-mutable-workflow-graph.md).
 
-## E04 — Crash/recovery boundary
+## E04 — Crash/recovery boundary — PASS
 
 Model “effect committed, checkpoint missing” and “checkpoint committed, effect unknown”.
 
@@ -57,6 +57,14 @@ Acceptance:
 - outcome-unknown is represented explicitly;
 - recovery never silently duplicates a non-idempotent effect;
 - scheduler decisions remain explainable from durable facts.
+
+Result: PASS. The separate `workflow-recovery` crate distinguishes durable
+intent from dispatch, keeps external reality separate from local knowledge,
+reuses `OperationId` across idempotent retries, and returns structured recovery
+decisions from `WorkflowGraph` plus `DurableJournal`. A deterministic external
+simulator proves that a committed non-idempotent effect remains at one commit
+after a crash, while an idempotent retry also remains at one logical commit.
+See [`E04-crash-recovery-boundary.md`](results/E04-crash-recovery-boundary.md).
 
 ## E05 — Typed stream backpressure
 

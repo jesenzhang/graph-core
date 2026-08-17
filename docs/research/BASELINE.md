@@ -1,7 +1,7 @@
 # Research Baseline
 
-Date: 2026-08-14
-Status: E01/E02/E02R/E02R-F1/E03 research baseline; E04/E05 not started
+Date: 2026-08-17
+Status: E01/E02/E02R/E02R-F1/E03/E04 research baseline; E05 not started
 
 ## Experiment status
 
@@ -12,7 +12,7 @@ Status: E01/E02/E02R/E02R-F1/E03 research baseline; E04/E05 not started
 | E02R — Capability runtime integrity | PASS |
 | E02R-F1 — Scope hierarchy closure | PASS |
 | E03 — Versioned mutable workflow graph | PASS |
-| E04 — Crash/recovery boundary | NOT STARTED |
+| E04 — Crash/recovery boundary | PASS |
 | E05 — Typed stream backpressure | NOT STARTED |
 
 ## 1. Research thesis
@@ -77,6 +77,13 @@ identity, DAG topology, topology-only revision, immutable completed facts,
 typed future mutations, atomic batches, expected-revision conflict detection,
 deterministic scheduler view, and deterministic replay. See
 [`E03-versioned-mutable-workflow-graph.md`](results/E03-versioned-mutable-workflow-graph.md).
+
+E04 PASS establishes the recovery boundary above the frozen Workflow Graph:
+durable intent and dispatch facts are distinct, unknown local outcomes are
+explicit, non-idempotent unknown outcomes require reconciliation, idempotent
+retries preserve `OperationId`, and known success completes execution facts
+without changing topology revision. See
+[`E04-crash-recovery-boundary.md`](results/E04-crash-recovery-boundary.md).
 
 ### 2.3 Execution Streams
 
