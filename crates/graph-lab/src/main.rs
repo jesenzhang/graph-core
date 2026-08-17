@@ -6,10 +6,11 @@ use execution_stream::{
     SequenceObservation, SequenceTracker, StreamItem,
 };
 use graph_core::Id;
+use runtime_core::{RunId, Runtime as CoreRuntime, StepResult, TaskConfig};
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{
-    AttemptId, DispatchRecord, DurableJournal, EffectIntent, EffectSemantics, OperationId,
-    RecoveryAction, classify_recovery,
+    AttemptId, DispatchRecord, DurableJournal, EffectIntent, EffectSemantics, KnownEffectOutcome,
+    OperationId, RecoveryAction, classify_recovery,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -257,8 +258,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "e05: lossless={lossless_status}, coalesced_gap={coalesced_gap}, telemetry_gap={telemetry_gap}"
     );
 
+    run_m1_smoke()?;
+
     drop(service);
     drop(model_v1);
     runtime.teardown();
+    Ok(())
+}
+
+fn run_m1_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let provider_id = Id::new("smoke-provider")?;
+    let smoke_scope = Scope::root();
+    let provider_v1 = smoke_scope.provide(
+        CapabilityDefinition::new(provider_id.clone(), "provider"),
+        |_| Ok(CapabilityValue::from_value("provider-v1".to_owned())),
+    )?;
+    let provider_v1_entry = provider_v1.entry_id();
+
+    let a = Task {
+        id: Id::new("m1-a")?,
+        label: "M1 A".to_owned(),
+    };
+    let b = Task {
+        id: Id::new("m1-b")?,
+        label: "M1 B".to_owned(),
+    };
+    let c = Task {
+        id: Id::new("m1-c")?,
+        label: "M1 C".to_owned(),
+    };
+    let mut workflow = WorkflowGraph::default();
+    workflow.apply_batch(
+        workflow.revision(),
+        [
+            WorkflowMutation::AddTask { task: a.clone() },
+            WorkflowMutation::AddTask { task: b.clone() },
+            WorkflowMutation::AddTask { task: c.clone() },
+            WorkflowMutation::AddDependency {
+                task_id: b.id.clone(),
+                dependency_id: a.id.clone(),
+            },
+            WorkflowMutation::AddDependency {
+                task_id: c.id.clone(),
+                dependency_id: b.id.clone(),
+            },
+        ],
+    )?;
+
+    let operation_id = OperationId::new("m1-idempotent-effect")?;
+    let mut runtime = CoreRuntime::start_run(
+        RunId::new("m1-smoke")?,
+        workflow,
+        smoke_scope.clone(),
+        [
+            (
+                a.id.clone(),
+                TaskConfig::new()
+                    .require_capability(provider_id.clone())
+                    .with_effect(operation_id.clone(), EffectSemantics::Idempotent),
+            ),
+            (
+                b.id.clone(),
+                TaskConfig::new().require_capability(provider_id.clone()),
+            ),
+        ],
+    )?;
+
+    let first_attempt = match runtime.step()? {
+        StepResult::EffectPending { attempt_id, .. } => attempt_id,
+        result => return Err(format!("unexpected M1 first step: {result:?}").into()),
+    };
+    runtime.dispatch_effect(&operation_id)?;
+    let recovery = runtime.recover(&operation_id)?;
+    if recovery.action != RecoveryAction::RetrySameOperation {
+        return Err(format!("unexpected M1 recovery action: {}", recovery.action).into());
+    }
+
+    let generation = smoke_scope
+        .generation(&provider_id)
+        .expect("smoke provider is visible");
+    let provider_v2 = smoke_scope.replace(
+        CapabilityDefinition::new(provider_id.clone(), "provider"),
+        generation,
+        |_| Ok(CapabilityValue::from_value("provider-v2".to_owned())),
+    )?;
+    let retry_attempt = runtime.dispatch_effect(&operation_id)?;
+    runtime.record_effect_outcome(
+        &operation_id,
+        retry_attempt.clone(),
+        KnownEffectOutcome::Succeeded,
+    )?;
+    runtime.recover(&operation_id)?;
+    if first_attempt == retry_attempt {
+        return Err("M1 retry must use a new attempt identity".into());
+    }
+    runtime.run_until_blocked()?;
+
+    runtime.emit_progress(&a.id, 10)?;
+    runtime.emit_progress(&a.id, 20)?;
+    runtime.emit_telemetry("m1-first")?;
+    runtime.emit_telemetry("m1-latest")?;
+    let progress_count = runtime.drain_progress_events().len();
+    let telemetry_count = runtime.drain_telemetry_events().len();
+    if progress_count != 1 || telemetry_count != 1 {
+        return Err("M1 stream policy did not coalesce/drop as expected".into());
+    }
+
+    let v1_attempts = runtime
+        .attempts()
+        .iter()
+        .filter(|attempt| {
+            attempt
+                .capability(&provider_id)
+                .is_some_and(|pin| pin.entry_id == provider_v1_entry)
+        })
+        .count();
+    let v2_attempts = runtime
+        .attempts()
+        .iter()
+        .filter(|attempt| {
+            attempt
+                .capability(&provider_id)
+                .is_some_and(|pin| pin.entry_id == provider_v2.entry_id())
+        })
+        .count();
+    let completed = runtime.workflow().completed_tasks().len() == 3;
+    println!(
+        "m1: run={} tasks={} attempts={} provider_v1_attempts={} provider_v2_attempts={} recovery=idempotent-retry-ok stream_loss=non_authoritative",
+        if completed { "completed" } else { "blocked" },
+        runtime.workflow().tasks().len(),
+        runtime.attempts().len(),
+        v1_attempts,
+        v2_attempts,
+    );
     Ok(())
 }

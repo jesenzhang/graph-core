@@ -311,6 +311,15 @@ impl DurableJournal {
             .ok_or_else(|| JournalError::UnknownOperation(operation_id.clone()))
     }
 
+    /// Returns the logical operation owned by a workflow task, if any.
+    ///
+    /// The mapping is derived from the durable intent admission table. It is
+    /// exposed so coordinators do not need to keep a second task/effect map.
+    #[must_use]
+    pub fn operation_for_task(&self, task_id: &graph_core::Id) -> Option<&OperationId> {
+        self.task_operations.get(task_id)
+    }
+
     /// Returns the most recently persisted dispatch for an operation.
     #[must_use]
     pub fn latest_dispatch(&self, operation_id: &OperationId) -> Option<&DispatchRecord> {

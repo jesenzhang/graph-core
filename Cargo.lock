@@ -27,6 +27,18 @@ dependencies = [
  "capability-graph",
  "execution-stream",
  "graph-core",
+ "runtime-core",
+ "workflow-graph",
+ "workflow-recovery",
+]
+
+[[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
+ "capability-graph",
+ "execution-stream",
+ "graph-core",
  "workflow-graph",
  "workflow-recovery",
 ]

@@ -5,6 +5,7 @@ members = [
     "crates/workflow-graph",
     "crates/workflow-recovery",
     "crates/execution-stream",
+    "crates/runtime-core",
     "crates/graph-lab",
 ]
 resolver = "3"

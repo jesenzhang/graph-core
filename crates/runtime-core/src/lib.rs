@@ -1,0 +1,838 @@
+//! A synchronous, deterministic coordinator for the graph-core structures.
+//!
+//! [`WorkflowGraph`] remains the authority for topology and completion,
+//! [`DurableJournal`] remains the authority for external effects, and
+//! [`capability_graph::Scope`] remains the authority for capability lifetime
+//! and replacement. This crate owns coordination and disposable observations
+//! only.
+
+use capability_graph::{CapabilityHandle, EntryId, Generation, Scope, ScopeError};
+use execution_stream::{
+    CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, SequenceError,
+    StreamItem, StreamSequencer,
+};
+use graph_core::Id;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use workflow_graph::{MutationBatch, WorkflowGraph, WorkflowGraphError, WorkflowMutationRecord};
+use workflow_recovery::{
+    AttemptId, DispatchRecord, DurableJournal, EffectIntent, EffectSemantics, KnownEffectOutcome,
+    OperationId, OutcomeRecord, RecoveredEffectState, RecoveryAction, RecoveryDecision,
+    classify_recovery,
+};
+
+/// Identity of one workflow execution.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RunId(Id);
+
+impl RunId {
+    /// Creates a non-empty run identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`graph_core::InvalidId`] for an empty or whitespace-only value.
+    pub fn new(value: impl Into<String>) -> Result<Self, graph_core::InvalidId> {
+        Id::new(value).map(Self)
+    }
+
+    /// Returns the identity as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A capability handle pinned for the complete lifetime of one task attempt.
+#[derive(Clone, Debug)]
+pub struct CapabilityPin {
+    /// Logical capability identity.
+    pub capability_id: Id,
+    /// Generation observed when the pin was created.
+    pub generation: Generation,
+    /// Exact published entry observed when the pin was created.
+    pub entry_id: EntryId,
+    handle: CapabilityHandle,
+}
+
+impl CapabilityPin {
+    /// Returns the exact handle retained by this pin.
+    #[must_use]
+    pub fn handle(&self) -> &CapabilityHandle {
+        &self.handle
+    }
+}
+
+/// One task execution attempt and its immutable capability snapshot.
+#[derive(Clone, Debug)]
+pub struct TaskAttempt {
+    /// Workflow execution containing this attempt.
+    pub run_id: RunId,
+    /// Logical workflow task being attempted.
+    pub task_id: Id,
+    /// Unique transport/execution attempt identity.
+    pub attempt_id: AttemptId,
+    /// Logical effect owned by this attempt, when the task has one.
+    pub operation_id: Option<OperationId>,
+    /// Exact capability entries retained by this attempt.
+    pub capability_pins: Vec<CapabilityPin>,
+}
+
+impl TaskAttempt {
+    /// Looks up one pinned capability by logical identity.
+    #[must_use]
+    pub fn capability(&self, capability_id: &Id) -> Option<&CapabilityPin> {
+        self.capability_pins
+            .iter()
+            .find(|pin| &pin.capability_id == capability_id)
+    }
+}
+
+/// Runtime configuration for one logical external effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectSpec {
+    /// Stable logical operation identity.
+    pub operation_id: OperationId,
+    /// Whether retrying this operation is externally safe.
+    pub semantics: EffectSemantics,
+}
+
+/// Runtime inputs for a task; workflow topology and completion remain in the graph.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskConfig {
+    required_capabilities: BTreeSet<Id>,
+    effect: Option<EffectSpec>,
+}
+
+impl TaskConfig {
+    /// Creates an empty task configuration.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            required_capabilities: BTreeSet::new(),
+            effect: None,
+        }
+    }
+
+    /// Adds one capability requirement in deterministic order.
+    #[must_use]
+    pub fn require_capability(mut self, capability_id: Id) -> Self {
+        self.required_capabilities.insert(capability_id);
+        self
+    }
+
+    /// Assigns the one effect owned by this task.
+    #[must_use]
+    pub fn with_effect(mut self, operation_id: OperationId, semantics: EffectSemantics) -> Self {
+        self.effect = Some(EffectSpec {
+            operation_id,
+            semantics,
+        });
+        self
+    }
+
+    /// Returns required capabilities in deterministic order.
+    pub fn required_capabilities(&self) -> impl Iterator<Item = &Id> {
+        self.required_capabilities.iter()
+    }
+
+    /// Returns the configured effect, if any.
+    #[must_use]
+    pub const fn effect(&self) -> Option<&EffectSpec> {
+        self.effect.as_ref()
+    }
+}
+
+/// Non-authoritative observations emitted by the Runtime Core.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeEvent {
+    /// A task attempt acquired its capability pins.
+    TaskStarted {
+        /// Workflow execution identity.
+        run_id: RunId,
+        /// Task identity.
+        task_id: Id,
+        /// Attempt identity.
+        attempt_id: AttemptId,
+    },
+    /// A disposable task progress observation.
+    TaskProgress {
+        /// Task identity.
+        task_id: Id,
+        /// Progress percentage represented by this observation.
+        progress: u8,
+    },
+    /// A task completion observation after the workflow fact was recorded.
+    TaskCompleted {
+        /// Workflow execution identity.
+        run_id: RunId,
+        /// Task identity.
+        task_id: Id,
+        /// Attempt identity responsible for the completion.
+        attempt_id: AttemptId,
+    },
+    /// A disposable diagnostic observation.
+    Telemetry {
+        /// Diagnostic payload.
+        message: String,
+    },
+}
+
+/// Result of one deterministic scheduler step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StepResult {
+    /// A task completed during this step.
+    Completed {
+        /// Completed task identity.
+        task_id: Id,
+        /// Attempt that produced the completion fact.
+        attempt_id: AttemptId,
+    },
+    /// An effect task is prepared and awaits an explicit dispatch/outcome.
+    EffectPending {
+        /// Task whose effect is pending.
+        task_id: Id,
+        /// Attempt that pinned capabilities for the pending work.
+        attempt_id: AttemptId,
+        /// Logical effect identity.
+        operation_id: OperationId,
+    },
+    /// A ready task cannot advance without a recovery decision or observation.
+    Blocked {
+        /// Task that caused the scheduler to stop, if one exists.
+        task_id: Id,
+        /// Effect identity requiring attention, if one exists.
+        operation_id: Option<OperationId>,
+        /// Durable recovery action currently indicated.
+        action: RecoveryAction,
+    },
+    /// No non-cancelled task is ready.
+    Idle,
+}
+
+/// Result of cancelling a task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Cancellation {
+    /// The task had not been dispatched and is now prevented from starting.
+    NotDispatched {
+        /// Cancelled task identity.
+        task_id: Id,
+    },
+    /// An external dispatch already exists; cancellation cannot erase it.
+    AlreadyDispatched {
+        /// Task whose dispatch remains authoritative.
+        task_id: Id,
+        /// Logical effect identity.
+        operation_id: OperationId,
+        /// Dispatch attempt identity.
+        attempt_id: AttemptId,
+    },
+}
+
+/// Errors returned by the synchronous runtime coordinator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeError {
+    /// Workflow topology or completion rejected a mutation.
+    Workflow(WorkflowGraphError),
+    /// Capability admission or lookup rejected an attempt.
+    Capability(ScopeError),
+    /// A durable effect fact was invalid.
+    Journal(workflow_recovery::JournalError),
+    /// A runtime observation stream exhausted its sequence.
+    Stream(SequenceError),
+    /// A requested task does not exist in the workflow authority.
+    UnknownTask(Id),
+    /// A configured capability was not visible when an attempt started.
+    MissingCapability {
+        /// Task that could not start.
+        task_id: Id,
+        /// Capability that was not visible.
+        capability_id: Id,
+    },
+    /// The deterministic attempt identity allocator is exhausted.
+    AttemptIdExhausted,
+    /// A cancelled task cannot be dispatched before its first dispatch.
+    CancelledBeforeDispatch(Id),
+    /// A cancelled task already has an external dispatch, so no retry is issued.
+    CancelledAfterDispatch {
+        /// Cancelled task identity.
+        task_id: Id,
+        /// Existing dispatch identity.
+        operation_id: OperationId,
+    },
+    /// A non-idempotent unknown outcome needs reconciliation.
+    ReconciliationRequired(OperationId),
+    /// An operation already has a known outcome.
+    OutcomeAlreadyKnown(OperationId),
+    /// A coalescing progress stream is full for a new semantic key.
+    ProgressBackpressure,
+    /// The lossless lifecycle stream is full.
+    ExecutionBackpressure,
+}
+
+impl From<WorkflowGraphError> for RuntimeError {
+    fn from(error: WorkflowGraphError) -> Self {
+        Self::Workflow(error)
+    }
+}
+
+impl From<ScopeError> for RuntimeError {
+    fn from(error: ScopeError) -> Self {
+        Self::Capability(error)
+    }
+}
+
+impl From<workflow_recovery::JournalError> for RuntimeError {
+    fn from(error: workflow_recovery::JournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl From<SequenceError> for RuntimeError {
+    fn from(error: SequenceError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workflow(error) => write!(f, "workflow error: {error}"),
+            Self::Capability(error) => write!(f, "capability error: {error}"),
+            Self::Journal(error) => write!(f, "journal error: {error}"),
+            Self::Stream(error) => write!(f, "stream error: {error}"),
+            Self::UnknownTask(task_id) => write!(f, "unknown task: {task_id}"),
+            Self::MissingCapability {
+                task_id,
+                capability_id,
+            } => write!(
+                f,
+                "task {task_id} requires unavailable capability {capability_id}"
+            ),
+            Self::AttemptIdExhausted => f.write_str("task attempt identity exhausted"),
+            Self::CancelledBeforeDispatch(task_id) => {
+                write!(f, "task {task_id} was cancelled before dispatch")
+            }
+            Self::CancelledAfterDispatch {
+                task_id,
+                operation_id,
+            } => write!(
+                f,
+                "task {task_id} was cancelled after dispatch of {operation_id}"
+            ),
+            Self::ReconciliationRequired(operation_id) => {
+                write!(f, "effect {operation_id} requires reconciliation")
+            }
+            Self::OutcomeAlreadyKnown(operation_id) => {
+                write!(f, "effect {operation_id} already has a known outcome")
+            }
+            Self::ProgressBackpressure => f.write_str("progress stream is backpressured"),
+            Self::ExecutionBackpressure => f.write_str("execution stream is backpressured"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
+/// Deterministic single-process Runtime Core.
+pub struct Runtime {
+    run_id: RunId,
+    workflow: WorkflowGraph,
+    scope: Scope,
+    journal: DurableJournal,
+    task_configs: BTreeMap<Id, TaskConfig>,
+    attempts: Vec<TaskAttempt>,
+    cancelled: BTreeSet<Id>,
+    next_attempt_number: u64,
+    execution_sequencer: StreamSequencer,
+    progress_sequencer: StreamSequencer,
+    telemetry_sequencer: StreamSequencer,
+    execution_events: LosslessBuffer<RuntimeEvent>,
+    progress_events: CoalescingBuffer<Id, RuntimeEvent>,
+    telemetry_events: LossyBuffer<RuntimeEvent>,
+}
+
+impl Runtime {
+    /// Starts a deterministic run over an existing workflow graph and scope.
+    ///
+    /// Task configurations are runtime inputs. They do not become workflow
+    /// topology or completion facts.
+    pub fn start_run<I>(
+        run_id: RunId,
+        workflow: WorkflowGraph,
+        scope: Scope,
+        task_configs: I,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IntoIterator<Item = (Id, TaskConfig)>,
+    {
+        let mut configs = BTreeMap::new();
+        for (task_id, config) in task_configs {
+            if workflow.task(&task_id).is_none() {
+                return Err(RuntimeError::UnknownTask(task_id));
+            }
+            configs.insert(task_id, config);
+        }
+
+        Ok(Self {
+            run_id,
+            workflow,
+            scope,
+            journal: DurableJournal::new(),
+            task_configs: configs,
+            attempts: Vec::new(),
+            cancelled: BTreeSet::new(),
+            next_attempt_number: 1,
+            execution_sequencer: StreamSequencer::new(stream_id("runtime-events")),
+            progress_sequencer: StreamSequencer::new(stream_id("runtime-progress")),
+            telemetry_sequencer: StreamSequencer::new(stream_id("runtime-telemetry")),
+            execution_events: LosslessBuffer::new(128).expect("runtime event capacity is nonzero"),
+            progress_events: CoalescingBuffer::new(8)
+                .expect("runtime progress capacity is nonzero"),
+            telemetry_events: LossyBuffer::new(1).expect("runtime telemetry capacity is nonzero"),
+        })
+    }
+
+    /// Returns the run identity.
+    #[must_use]
+    pub const fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// Returns the authoritative workflow aggregate.
+    #[must_use]
+    pub const fn workflow(&self) -> &WorkflowGraph {
+        &self.workflow
+    }
+
+    /// Returns the authoritative durable effect journal.
+    #[must_use]
+    pub const fn journal(&self) -> &DurableJournal {
+        &self.journal
+    }
+
+    /// Returns the capability scope used for future resolutions.
+    #[must_use]
+    pub const fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Returns all attempts in deterministic creation order.
+    #[must_use]
+    pub fn attempts(&self) -> &[TaskAttempt] {
+        &self.attempts
+    }
+
+    /// Adds or replaces runtime inputs for an unfinished task.
+    pub fn configure_task(&mut self, task_id: Id, config: TaskConfig) -> Result<(), RuntimeError> {
+        if self.workflow.task(&task_id).is_none() {
+            return Err(RuntimeError::UnknownTask(task_id));
+        }
+        self.task_configs.insert(task_id, config);
+        Ok(())
+    }
+
+    /// Applies an atomic workflow mutation through the graph authority.
+    pub fn apply_workflow_mutation<B>(
+        &mut self,
+        expected_revision: graph_core::Revision,
+        batch: B,
+    ) -> Result<WorkflowMutationRecord, RuntimeError>
+    where
+        B: Into<MutationBatch>,
+    {
+        self.workflow
+            .apply_batch(expected_revision, batch)
+            .map_err(Into::into)
+    }
+
+    /// Persists an effect intent before any external dispatch.
+    pub fn record_effect_intent(
+        &mut self,
+        task_id: Id,
+        operation_id: OperationId,
+        semantics: EffectSemantics,
+    ) -> Result<(), RuntimeError> {
+        if self.workflow.task(&task_id).is_none() {
+            return Err(RuntimeError::UnknownTask(task_id));
+        }
+        if self.workflow.is_completed(&task_id) {
+            return Err(RuntimeError::Workflow(
+                WorkflowGraphError::TaskAlreadyCompleted(task_id),
+            ));
+        }
+        self.journal.persist_intent(EffectIntent {
+            task_id,
+            operation_id,
+            semantics,
+        })?;
+        Ok(())
+    }
+
+    /// Dispatches an effect, allocating a new attempt for an idempotent retry.
+    pub fn dispatch_effect(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Result<AttemptId, RuntimeError> {
+        let intent = self.journal.intent(operation_id)?.clone();
+        let state = self.journal.state(operation_id);
+        if self.cancelled.contains(&intent.task_id) {
+            return match state {
+                RecoveredEffectState::OutcomeUnknown => Err(RuntimeError::CancelledAfterDispatch {
+                    task_id: intent.task_id,
+                    operation_id: operation_id.clone(),
+                }),
+                _ => Err(RuntimeError::CancelledBeforeDispatch(intent.task_id)),
+            };
+        }
+
+        let attempt_id = match state {
+            RecoveredEffectState::Prepared => self
+                .pending_attempt(&intent.task_id, operation_id)
+                .map_or_else(
+                || self.begin_attempt(&intent.task_id, Some(operation_id.clone())),
+                Ok,
+            )?,
+            RecoveredEffectState::OutcomeUnknown => {
+                if intent.semantics == EffectSemantics::NonIdempotent {
+                    return Err(RuntimeError::ReconciliationRequired(operation_id.clone()));
+                }
+                self.begin_attempt(&intent.task_id, Some(operation_id.clone()))?
+            }
+            RecoveredEffectState::OutcomeKnown(_) => {
+                return Err(RuntimeError::OutcomeAlreadyKnown(operation_id.clone()));
+            }
+            RecoveredEffectState::NotPrepared => unreachable!("intent lookup proved prepared"),
+        };
+
+        self.journal.persist_dispatch(DispatchRecord {
+            operation_id: operation_id.clone(),
+            attempt_id: attempt_id.clone(),
+        })?;
+        Ok(attempt_id)
+    }
+
+    /// Records a known effect outcome in the durable journal.
+    ///
+    /// Workflow completion is applied by [`Self::recover`] or the next
+    /// scheduler step, which preserves the explicit recovery boundary for a
+    /// known success.
+    pub fn record_effect_outcome(
+        &mut self,
+        operation_id: &OperationId,
+        attempt_id: AttemptId,
+        outcome: KnownEffectOutcome,
+    ) -> Result<(), RuntimeError> {
+        self.journal.persist_outcome(OutcomeRecord {
+            operation_id: operation_id.clone(),
+            attempt_id: attempt_id.clone(),
+            outcome,
+        })?;
+        Ok(())
+    }
+
+    /// Classifies recovery from workflow and journal authorities only.
+    ///
+    /// A known success is applied to the workflow completion authority without
+    /// re-executing the external effect. Retry and reconciliation decisions are
+    /// returned to the caller for explicit action.
+    pub fn recover(
+        &mut self,
+        operation_id: &OperationId,
+    ) -> Result<RecoveryDecision, RuntimeError> {
+        let decision = classify_recovery(&self.workflow, &self.journal, operation_id)?;
+        if decision.action == RecoveryAction::CompleteWithoutReexecution {
+            let intent = self.journal.intent(operation_id)?.clone();
+            let attempt_id = self
+                .journal
+                .known_outcome(operation_id)
+                .expect("complete decision requires a known outcome")
+                .attempt_id
+                .clone();
+            if !self.workflow.is_completed(&intent.task_id) {
+                self.workflow.complete(&intent.task_id)?;
+                self.emit_completed(intent.task_id, attempt_id)?;
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Prevents a task from starting when it has not yet been dispatched.
+    pub fn cancel_task(&mut self, task_id: &Id) -> Result<Cancellation, RuntimeError> {
+        if self.workflow.task(task_id).is_none() {
+            return Err(RuntimeError::UnknownTask(task_id.clone()));
+        }
+        self.cancelled.insert(task_id.clone());
+        if let Some(operation_id) = self.journal.operation_for_task(task_id) {
+            if let Some(dispatch) = self.journal.latest_dispatch(operation_id) {
+                return Ok(Cancellation::AlreadyDispatched {
+                    task_id: task_id.clone(),
+                    operation_id: operation_id.clone(),
+                    attempt_id: dispatch.attempt_id.clone(),
+                });
+            }
+        }
+        Ok(Cancellation::NotDispatched {
+            task_id: task_id.clone(),
+        })
+    }
+
+    /// Executes deterministic ready work until no further automatic step is possible.
+    pub fn run_until_blocked(&mut self) -> Result<Vec<StepResult>, RuntimeError> {
+        let mut results = Vec::new();
+        loop {
+            let result = self.step()?;
+            let stop = !matches!(result, StepResult::Completed { .. });
+            results.push(result);
+            if stop {
+                return Ok(results);
+            }
+        }
+    }
+
+    /// Executes the lexicographically first ready, non-cancelled task.
+    pub fn step(&mut self) -> Result<StepResult, RuntimeError> {
+        for task_id in self.workflow.ready_tasks() {
+            if self.cancelled.contains(&task_id) {
+                continue;
+            }
+            return self.step_task(task_id);
+        }
+        Ok(StepResult::Idle)
+    }
+
+    /// Emits a coalescible progress observation.
+    pub fn emit_progress(&mut self, task_id: &Id, progress: u8) -> Result<(), RuntimeError> {
+        let item = self.progress_sequencer.emit(RuntimeEvent::TaskProgress {
+            task_id: task_id.clone(),
+            progress,
+        })?;
+        self.progress_events
+            .try_push(KeyedStreamItem {
+                key: task_id.clone(),
+                item,
+            })
+            .map_err(|PushError::Backpressure(_)| RuntimeError::ProgressBackpressure)
+    }
+
+    /// Emits a lossy telemetry observation.
+    pub fn emit_telemetry(&mut self, message: impl Into<String>) -> Result<(), RuntimeError> {
+        let item = self.telemetry_sequencer.emit(RuntimeEvent::Telemetry {
+            message: message.into(),
+        })?;
+        self.telemetry_events.push(item);
+        Ok(())
+    }
+
+    /// Drains lossless task lifecycle observations.
+    pub fn drain_execution_events(&mut self) -> Vec<StreamItem<RuntimeEvent>> {
+        drain_lossless(&mut self.execution_events)
+    }
+
+    /// Drains retained progress observations.
+    pub fn drain_progress_events(&mut self) -> Vec<KeyedStreamItem<Id, RuntimeEvent>> {
+        drain_coalescing(&mut self.progress_events)
+    }
+
+    /// Drains retained telemetry observations.
+    pub fn drain_telemetry_events(&mut self) -> Vec<StreamItem<RuntimeEvent>> {
+        drain_lossy(&mut self.telemetry_events)
+    }
+
+    fn step_task(&mut self, task_id: Id) -> Result<StepResult, RuntimeError> {
+        let operation = self.ensure_configured_effect(&task_id)?;
+        let Some((operation_id, _semantics)) = operation else {
+            let attempt_id = self.begin_attempt(&task_id, None)?;
+            self.workflow.complete(&task_id)?;
+            self.emit_completed(task_id.clone(), attempt_id.clone())?;
+            return Ok(StepResult::Completed {
+                task_id,
+                attempt_id,
+            });
+        };
+
+        match self.journal.state(&operation_id) {
+            RecoveredEffectState::Prepared => {
+                let attempt_id = self.pending_attempt(&task_id, &operation_id).map_or_else(
+                    || self.begin_attempt(&task_id, Some(operation_id.clone())),
+                    Ok,
+                )?;
+                Ok(StepResult::EffectPending {
+                    task_id,
+                    attempt_id,
+                    operation_id,
+                })
+            }
+            RecoveredEffectState::OutcomeUnknown => {
+                let decision = classify_recovery(&self.workflow, &self.journal, &operation_id)?;
+                Ok(StepResult::Blocked {
+                    task_id,
+                    operation_id: Some(operation_id),
+                    action: decision.action,
+                })
+            }
+            RecoveredEffectState::OutcomeKnown(KnownEffectOutcome::Succeeded) => {
+                let attempt_id = self
+                    .journal
+                    .known_outcome(&operation_id)
+                    .expect("known success has outcome")
+                    .attempt_id
+                    .clone();
+                self.workflow.complete(&task_id)?;
+                self.emit_completed(task_id.clone(), attempt_id.clone())?;
+                Ok(StepResult::Completed {
+                    task_id,
+                    attempt_id,
+                })
+            }
+            RecoveredEffectState::OutcomeKnown(KnownEffectOutcome::Failed) => {
+                Ok(StepResult::Blocked {
+                    task_id,
+                    operation_id: Some(operation_id),
+                    action: RecoveryAction::ObserveFailure,
+                })
+            }
+            RecoveredEffectState::NotPrepared => unreachable!("configured effect is persisted"),
+        }
+    }
+
+    fn ensure_configured_effect(
+        &mut self,
+        task_id: &Id,
+    ) -> Result<Option<(OperationId, EffectSemantics)>, RuntimeError> {
+        if let Some(operation_id) = self.journal.operation_for_task(task_id).cloned() {
+            let semantics = self.journal.intent(&operation_id)?.semantics;
+            return Ok(Some((operation_id, semantics)));
+        }
+        let Some(effect) = self
+            .task_configs
+            .get(task_id)
+            .and_then(TaskConfig::effect)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.record_effect_intent(
+            task_id.clone(),
+            effect.operation_id.clone(),
+            effect.semantics,
+        )?;
+        Ok(Some((effect.operation_id, effect.semantics)))
+    }
+
+    fn begin_attempt(
+        &mut self,
+        task_id: &Id,
+        operation_id: Option<OperationId>,
+    ) -> Result<AttemptId, RuntimeError> {
+        let required_capabilities = self
+            .task_configs
+            .get(task_id)
+            .map(|config| {
+                config
+                    .required_capabilities
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut capability_pins = Vec::with_capacity(required_capabilities.len());
+        for capability_id in required_capabilities {
+            let handle =
+                self.scope
+                    .get(&capability_id)
+                    .ok_or_else(|| RuntimeError::MissingCapability {
+                        task_id: task_id.clone(),
+                        capability_id: capability_id.clone(),
+                    })?;
+            capability_pins.push(CapabilityPin {
+                capability_id,
+                generation: handle.generation(),
+                entry_id: handle.entry_id(),
+                handle,
+            });
+        }
+
+        let attempt_number = self.next_attempt_number;
+        self.next_attempt_number = self
+            .next_attempt_number
+            .checked_add(1)
+            .ok_or(RuntimeError::AttemptIdExhausted)?;
+        let attempt_id = AttemptId::new(format!("{}-attempt-{attempt_number}", self.run_id))
+            .expect("generated attempt identity is non-empty");
+        self.emit_started(task_id.clone(), attempt_id.clone())?;
+        self.attempts.push(TaskAttempt {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+            operation_id,
+            capability_pins,
+        });
+        Ok(attempt_id)
+    }
+
+    fn pending_attempt(&self, task_id: &Id, operation_id: &OperationId) -> Option<AttemptId> {
+        self.attempts
+            .iter()
+            .rev()
+            .find(|attempt| {
+                &attempt.task_id == task_id && attempt.operation_id.as_ref() == Some(operation_id)
+            })
+            .map(|attempt| attempt.attempt_id.clone())
+    }
+
+    fn emit_started(&mut self, task_id: Id, attempt_id: AttemptId) -> Result<(), RuntimeError> {
+        let item = self.execution_sequencer.emit(RuntimeEvent::TaskStarted {
+            run_id: self.run_id.clone(),
+            task_id,
+            attempt_id,
+        })?;
+        self.execution_events
+            .try_push(item)
+            .map_err(|_| RuntimeError::ExecutionBackpressure)
+    }
+
+    fn emit_completed(&mut self, task_id: Id, attempt_id: AttemptId) -> Result<(), RuntimeError> {
+        let item = self.execution_sequencer.emit(RuntimeEvent::TaskCompleted {
+            run_id: self.run_id.clone(),
+            task_id,
+            attempt_id,
+        })?;
+        self.execution_events
+            .try_push(item)
+            .map_err(|_| RuntimeError::ExecutionBackpressure)
+    }
+}
+
+fn stream_id(value: &str) -> Id {
+    Id::new(value).expect("static stream identity is non-empty")
+}
+
+fn drain_lossless<T>(buffer: &mut LosslessBuffer<T>) -> Vec<StreamItem<T>> {
+    let mut items = Vec::new();
+    while let Some(item) = buffer.pop() {
+        items.push(item);
+    }
+    items
+}
+
+fn drain_coalescing<K: Eq, T>(buffer: &mut CoalescingBuffer<K, T>) -> Vec<KeyedStreamItem<K, T>> {
+    let mut items = Vec::new();
+    while let Some(item) = buffer.pop() {
+        items.push(item);
+    }
+    items
+}
+
+fn drain_lossy<T>(buffer: &mut LossyBuffer<T>) -> Vec<StreamItem<T>> {
+    let mut items = Vec::new();
+    while let Some(item) = buffer.pop() {
+        items.push(item);
+    }
+    items
+}
