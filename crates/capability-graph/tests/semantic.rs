@@ -3,7 +3,7 @@
 use capability_graph::{
     CapabilityContext, CapabilityDefinition, CapabilityFiber, CapabilityId, CapabilityRegistry,
     CapabilityValue, EffectError, EffectScope, EffectStack, FiberError, FiberState,
-    PluginDefinition, PluginFactory, PluginLoadContext, PluginRuntime, ScopedEffect,
+    PluginDefinition, PluginFactory, PluginLoadContext, PluginRuntime, Scope, ScopedEffect,
 };
 use graph_core::Id;
 use std::future::Future;
@@ -112,6 +112,25 @@ fn context_has_parent_fallback_override_isolation_and_intercept_precedence() {
     );
 }
 
+#[test]
+fn context_from_scope_preserves_scope_parent_fallback() {
+    let parent = Scope::root();
+    parent
+        .provide(definition("model"), |_| Ok(value("parent")))
+        .expect("parent model");
+    let child = parent.child();
+    let context = CapabilityContext::from_scope(child);
+
+    assert_eq!(
+        context
+            .get(&id("model"))
+            .expect("scope parent fallback")
+            .downcast_ref::<String>()
+            .map(String::as_str),
+        Some("parent")
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn registry_has_one_runtime_and_multiple_fibers_with_exact_removal() {
     let registry = CapabilityRegistry::new();
@@ -149,6 +168,49 @@ async fn registry_has_one_runtime_and_multiple_fibers_with_exact_removal() {
     assert_eq!(runtime.fiber_count(), 0);
     assert!(first_context.get(&id("instance")).is_none());
     assert!(second_context.get(&id("instance")).is_none());
+    assert!(
+        registry
+            .instantiate(&id("plugin"), CapabilityContext::root(), "late".to_owned())
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn registry_removal_disposes_fiber_owned_by_runtime_after_caller_drop() {
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let disposed_for_factory = Arc::clone(&disposed);
+    let runtime = runtime(
+        definition("instance"),
+        factory(move |context| {
+            let disposed = Arc::clone(&disposed_for_factory);
+            async move {
+                context
+                    .effect(ScopedEffect::sync("cleanup", move || {
+                        disposed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }))
+                    .map_err(|error| error.to_string())?;
+                Ok(value("instance"))
+            }
+        }),
+    );
+    let registry = CapabilityRegistry::new();
+    registry
+        .register(Arc::clone(&runtime))
+        .expect("test runtime registers");
+    let fiber = registry
+        .instantiate(&id("plugin"), CapabilityContext::root(), String::new())
+        .expect("fiber instantiates");
+    start(&fiber).await;
+    drop(fiber);
+
+    assert_eq!(runtime.fiber_count(), 1);
+    registry
+        .remove(&id("plugin"))
+        .await
+        .expect("remove runtime");
+    assert_eq!(disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.fiber_count(), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -475,6 +537,85 @@ async fn stale_async_load_cannot_publish_and_dispose_during_load_is_final() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn stale_async_load_error_retries_latest_epoch() {
+    let root = CapabilityContext::root();
+    let model = root
+        .provide(definition("model"), |_| Ok(value("v1")))
+        .expect("model v1");
+    let child = root.child_context();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let disposed = Arc::new(AtomicUsize::new(0));
+    let started_for_factory = Arc::clone(&started);
+    let release_for_factory = Arc::clone(&release);
+    let calls_for_factory = Arc::clone(&calls);
+    let disposed_for_factory = Arc::clone(&disposed);
+    let service = runtime(
+        definition("service").depends_on(id("model")),
+        factory(move |context| {
+            let started = Arc::clone(&started_for_factory);
+            let release = Arc::clone(&release_for_factory);
+            let calls = Arc::clone(&calls_for_factory);
+            let disposed = Arc::clone(&disposed_for_factory);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let disposed_for_effect = Arc::clone(&disposed);
+                    context
+                        .effect(ScopedEffect::sync("stale cleanup", move || {
+                            disposed_for_effect.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }))
+                        .map_err(|error| error.to_string())?;
+                    started.notify_one();
+                    release.notified().await;
+                    Err("stale load failed".to_owned())
+                } else {
+                    let model = context
+                        .dependencies()
+                        .get(&id("model"))
+                        .expect("model dependency")
+                        .downcast_ref::<String>()
+                        .expect("model value")
+                        .clone();
+                    Ok(value(&model))
+                }
+            }
+        }),
+    );
+    let fiber = create_fiber(service, child, String::new());
+    let loading = {
+        let fiber = Arc::clone(&fiber);
+        tokio::spawn(async move { fiber.start().await })
+    };
+    started.notified().await;
+    root.scope()
+        .replace(definition("model"), model.generation(), |_| Ok(value("v2")))
+        .expect("replace while loading");
+    release.notify_one();
+
+    assert_eq!(
+        loading
+            .await
+            .expect("load task")
+            .expect("stale error retries latest epoch"),
+        FiberState::Active
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(disposed.load(Ordering::SeqCst), 1);
+    assert_eq!(fiber.error().await, None);
+    assert_eq!(
+        fiber
+            .handle()
+            .await
+            .expect("service handle")
+            .downcast_ref::<String>()
+            .map(String::as_str),
+        Some("v2")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn effect_stack_is_reverse_order_nested_and_failure_isolated() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut stack = EffectStack::new();
@@ -568,6 +709,26 @@ async fn partial_initialization_cleans_registered_effects() {
     assert_eq!(fiber.state(), FiberState::Failed);
     assert_eq!(disposed.load(Ordering::SeqCst), 1);
     assert!(fiber.context().get(&id("broken")).is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fiber_effect_rejected_when_pending_or_disposed() {
+    let runtime = runtime(
+        definition("effect"),
+        factory(|_| async { Ok(value("effect")) }),
+    );
+    let fiber = create_fiber(runtime, CapabilityContext::root(), String::new());
+
+    assert_eq!(
+        fiber.effect(ScopedEffect::sync("pending", || Ok(()))),
+        Err(FiberError::InactiveEffect(FiberState::Pending))
+    );
+    start(&fiber).await;
+    fiber.dispose().await.expect("dispose");
+    assert_eq!(
+        fiber.effect(ScopedEffect::sync("disposed", || Ok(()))),
+        Err(FiberError::InactiveEffect(FiberState::Disposed))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

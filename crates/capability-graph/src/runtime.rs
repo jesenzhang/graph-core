@@ -299,6 +299,10 @@ impl Scope {
         child
     }
 
+    pub(crate) fn parent(&self) -> Option<Self> {
+        self.state.parent.clone()
+    }
+
     /// Looks up the nearest capability visible from this scope.
     ///
     /// New lookups are rejected after the scope begins teardown. Handles

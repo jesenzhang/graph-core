@@ -66,10 +66,11 @@ impl CapabilityContext {
     /// Wraps an existing scope without copying or changing its entries.
     #[must_use]
     pub fn from_scope(scope: Scope) -> Self {
+        let parent = scope.parent().map(Self::from_scope);
         Self {
             state: Arc::new(ContextState {
                 scope,
-                parent: None,
+                parent,
                 isolation: BTreeSet::new(),
                 intercepts: BTreeMap::new(),
             }),
@@ -320,7 +321,7 @@ impl PluginDefinition {
 /// A plugin runtime metadata entry shared by multiple fibers.
 pub struct PluginRuntime {
     definition: Arc<PluginDefinition>,
-    fibers: Mutex<BTreeMap<FiberId, Weak<CapabilityFiber>>>,
+    fibers: Mutex<BTreeMap<FiberId, Arc<CapabilityFiber>>>,
     next_fiber: AtomicU64,
 }
 
@@ -359,9 +360,10 @@ impl PluginRuntime {
     /// Returns the number of live fiber instances.
     #[must_use]
     pub fn fiber_count(&self) -> usize {
-        let mut fibers = self.fibers.lock().expect("plugin fiber lock poisoned");
-        fibers.retain(|_, fiber| fiber.strong_count() != 0);
-        fibers.len()
+        self.fibers
+            .lock()
+            .expect("plugin fiber lock poisoned")
+            .len()
     }
 
     fn create_fiber(
@@ -389,7 +391,7 @@ impl PluginRuntime {
         self.fibers
             .lock()
             .expect("plugin fiber lock poisoned")
-            .insert(fiber.id(), Arc::downgrade(&fiber));
+            .insert(fiber.id(), Arc::clone(&fiber));
         Ok(fiber)
     }
 
@@ -406,7 +408,7 @@ impl PluginRuntime {
             .lock()
             .expect("plugin fiber lock poisoned")
             .values()
-            .filter_map(Weak::upgrade)
+            .cloned()
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for fiber in fibers {
@@ -487,8 +489,10 @@ impl CapabilityRegistry {
         context: CapabilityContext,
         config: PluginConfig,
     ) -> Result<Arc<CapabilityFiber>, RegistryError> {
-        let runtime = self
+        let runtimes = self.runtimes.lock().expect("plugin registry lock poisoned");
+        let runtime = runtimes
             .get(id)
+            .cloned()
             .ok_or_else(|| RegistryError::Unknown(id.clone()))?;
         runtime
             .create_fiber(context, config)
@@ -728,19 +732,14 @@ impl CapabilityFiber {
         self.dependency_epoch.lock().await.clone()
     }
 
-    /// Registers an effect against the current fiber epoch.
+    /// Registers an effect while the fiber is active.
     pub fn effect(&self, effect: ScopedEffect) -> Result<(), FiberError> {
-        match self.state() {
-            FiberState::Unloading | FiberState::Disposed => {
-                Err(FiberError::InactiveEffect(self.state()))
-            }
-            _ => self
-                .effects
-                .lock()
-                .expect("fiber effect lock poisoned")
-                .register(effect)
-                .map_err(FiberError::Effect),
+        let effects = self.effects.lock().expect("fiber effect lock poisoned");
+        let state = self.state();
+        if state != FiberState::Active {
+            return Err(FiberError::InactiveEffect(state));
         }
+        effects.register(effect).map_err(FiberError::Effect)
     }
 
     /// Marks a possible dependency change. The next stable operation observes
@@ -929,6 +928,16 @@ impl CapabilityFiber {
                     let errors = effects.dispose_all().await;
                     *self.last_cleanup_errors.lock().await = errors;
                     if self.dispose_requested.load(Ordering::Acquire) {
+                        return Err(FiberError::Disposed);
+                    }
+                    self.set_state(FiberState::Pending);
+                }
+                Err(_) if stale => {
+                    let errors = effects.dispose_all().await;
+                    *self.error.lock().await = None;
+                    *self.last_cleanup_errors.lock().await = errors;
+                    if self.dispose_requested.load(Ordering::Acquire) {
+                        self.set_state(FiberState::Disposed);
                         return Err(FiberError::Disposed);
                     }
                     self.set_state(FiberState::Pending);
@@ -1194,7 +1203,7 @@ pub enum FiberError {
     },
     /// Existing capability graph admission rejected publication.
     Scope(ScopeError),
-    /// An effect was attempted during unload or after disposal.
+    /// An effect was attempted while the fiber was not active.
     InactiveEffect(FiberState),
     /// The process-local fiber counter is exhausted.
     FiberIdExhausted,
