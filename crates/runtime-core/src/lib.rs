@@ -6,7 +6,9 @@
 //! and replacement. This crate owns coordination and disposable observations
 //! only.
 
-use capability_graph::{CapabilityHandle, EntryId, Generation, Scope, ScopeError};
+use capability_graph::{
+    CapabilityContext, CapabilityHandle, CapabilityRegistry, EntryId, Generation, Scope, ScopeError,
+};
 use execution_stream::{
     CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, SequenceError,
     StreamItem, StreamSequencer,
@@ -347,6 +349,8 @@ pub struct Runtime {
     run_id: RunId,
     workflow: WorkflowGraph,
     scope: Scope,
+    capability_context: CapabilityContext,
+    capability_registry: CapabilityRegistry,
     journal: DurableJournal,
     task_configs: BTreeMap<Id, TaskConfig>,
     attempts: Vec<TaskAttempt>,
@@ -383,10 +387,13 @@ impl Runtime {
             configs.insert(task_id, config);
         }
 
+        let capability_context = CapabilityContext::from_scope(scope.clone());
         Ok(Self {
             run_id,
             workflow,
             scope,
+            capability_context,
+            capability_registry: CapabilityRegistry::new(),
             journal: DurableJournal::new(),
             task_configs: configs,
             attempts: Vec::new(),
@@ -425,6 +432,20 @@ impl Runtime {
     #[must_use]
     pub const fn scope(&self) -> &Scope {
         &self.scope
+    }
+
+    /// Returns the explicit Cordis-derived context view used for capability
+    /// runtime coordination. It does not become an authority for workflow or
+    /// durable effect facts.
+    #[must_use]
+    pub const fn capability_context(&self) -> &CapabilityContext {
+        &self.capability_context
+    }
+
+    /// Returns the process-local plugin runtime registry.
+    #[must_use]
+    pub const fn capability_registry(&self) -> &CapabilityRegistry {
+        &self.capability_registry
     }
 
     /// Returns all attempts in deterministic creation order.
@@ -774,13 +795,12 @@ impl Runtime {
             .unwrap_or_default();
         let mut capability_pins = Vec::with_capacity(required_capabilities.len());
         for capability_id in required_capabilities {
-            let handle =
-                self.scope
-                    .get(&capability_id)
-                    .ok_or_else(|| RuntimeError::MissingCapability {
-                        task_id: task_id.clone(),
-                        capability_id: capability_id.clone(),
-                    })?;
+            let handle = self.capability_context.get(&capability_id).ok_or_else(|| {
+                RuntimeError::MissingCapability {
+                    task_id: task_id.clone(),
+                    capability_id: capability_id.clone(),
+                }
+            })?;
             capability_pins.push(CapabilityPin {
                 capability_id,
                 generation: handle.generation(),

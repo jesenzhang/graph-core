@@ -7,10 +7,11 @@
 3. **Execution Streams** — high-frequency ordered runtime data such as model deltas, tool output, events, and progress. These are intentionally modeled as typed streams, not as a mutable general-purpose graph.
 
 Research Baseline v0 is complete. M1 Runtime Core is implemented as a
-synchronous, single-process,
-deterministic Runtime Core over the validated structures. It is still an
-in-memory candidate: there is no persistence layer, async runtime, provider
-SDK, plugin loader, or distributed execution.
+synchronous, single-process, deterministic coordinator over the validated
+structures. M2-A adds a process-local asynchronous Capability Runtime for
+Cordis-derived context, registry, fiber, and effect semantics. There is still
+no persistence layer, provider SDK, dynamic plugin loader, or distributed
+execution.
 
 ## Why this exists
 
@@ -50,6 +51,15 @@ intent/dispatch/outcome recovery, and non-authoritative execution streams.
 `graph-lab` includes a real smoke run. See
 [`docs/runtime/M1-runtime-core.md`](docs/runtime/M1-runtime-core.md) for the
 authority model, invariants, and current limitations.
+
+## M2-A Capability Runtime
+
+`capability-graph` now owns explicit `CapabilityContext`, `CapabilityRegistry`,
+`CapabilityFiber`, dependency epochs, and reverse-ordered `EffectStack`
+semantics. The runtime preserves exact capability generation/entry pinning for
+in-flight M1 attempts. See [`docs/research/CORDIS_PORT_MATRIX.md`](docs/research/CORDIS_PORT_MATRIX.md),
+[`docs/architecture/0003-cordis-semantic-port-decisions.md`](docs/architecture/0003-cordis-semantic-port-decisions.md),
+and [`docs/runtime/M2-B-handoff.md`](docs/runtime/M2-B-handoff.md).
 
 ## First commands
 

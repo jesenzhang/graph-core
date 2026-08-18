@@ -82,6 +82,10 @@ pub struct ResolvedDependencies {
 }
 
 impl ResolvedDependencies {
+    pub(crate) fn from_handles(handles: BTreeMap<CapabilityId, CapabilityHandle>) -> Self {
+        Self { handles }
+    }
+
     /// Looks up the exact published handle resolved for dependency id.
     #[must_use]
     pub fn get(&self, id: &CapabilityId) -> Option<&CapabilityHandle> {
@@ -325,6 +329,15 @@ impl Scope {
         self.get(id).map(|handle| handle.generation())
     }
 
+    /// Returns whether this scope has a local entry for a capability.
+    ///
+    /// Context isolation uses this to distinguish a local publication from a
+    /// parent fallback without copying the parent entry map.
+    #[must_use]
+    pub fn has_local(&self, id: &CapabilityId) -> bool {
+        self.has_local_entry(id)
+    }
+
     /// Validates a candidate against the current visible graph.
     ///
     /// The returned proof is a snapshot for inspection. Publication performs
@@ -384,6 +397,78 @@ impl Scope {
         )
     }
 
+    /// Publishes a value that was initialized asynchronously after the normal
+    /// graph admission boundary. The supplied dependency snapshot is checked
+    /// again at publication, so a provider replacement cannot publish a stale
+    /// value into a new epoch.
+    pub(crate) fn provide_value(
+        &self,
+        definition: CapabilityDefinition,
+        dependencies: ResolvedDependencies,
+        value: CapabilityValue,
+    ) -> Result<CapabilityHandle, ScopeError> {
+        for dependency in &definition.dependencies {
+            let expected = dependencies
+                .get(&dependency.id)
+                .expect("validated dependency snapshot must contain every requirement");
+            let current =
+                self.get(&dependency.id)
+                    .ok_or_else(|| ScopeError::MissingDependency {
+                        capability: definition.id.clone(),
+                        dependency: dependency.id.clone(),
+                    })?;
+            if current.generation() != expected.generation()
+                || current.entry_id() != expected.entry_id()
+            {
+                return Err(ScopeError::DependencyChanged {
+                    capability: definition.id.clone(),
+                    dependency: dependency.id.clone(),
+                });
+            }
+        }
+        self.publish_preconstructed(definition, PublishExpectation::New, dependencies, value)
+    }
+
+    /// Removes one exact local publication. A stale fiber cannot remove a
+    /// later replacement because the expected generation is checked under the
+    /// topology lock.
+    pub(crate) fn remove_local(
+        &self,
+        capability: &CapabilityId,
+        expected_generation: Generation,
+    ) -> Result<(), ScopeError> {
+        let old = {
+            let _topology = self
+                .state
+                .topology
+                .write()
+                .expect("scope topology lock poisoned");
+            if !self.is_open() {
+                return Err(ScopeError::Closed);
+            }
+            let mut entries = self
+                .state
+                .entries
+                .write()
+                .expect("scope entry lock poisoned");
+            let Some(entry) = entries.get(capability) else {
+                return Err(ScopeError::NoLocalEntry {
+                    capability: capability.clone(),
+                });
+            };
+            if entry.generation != expected_generation {
+                return Err(ScopeError::ReplacementConflict {
+                    capability: capability.clone(),
+                    expected: expected_generation,
+                    actual: entry.generation,
+                });
+            }
+            entries.remove(capability)
+        };
+        drop(old);
+        Ok(())
+    }
+
     fn publish<F>(
         &self,
         definition: CapabilityDefinition,
@@ -411,9 +496,19 @@ impl Scope {
             capability: definition.id.clone(),
             reason,
         })?;
+        self.publish_preconstructed(definition, expectation, dependencies, value)
+    }
+
+    fn publish_preconstructed(
+        &self,
+        definition: CapabilityDefinition,
+        expectation: PublishExpectation,
+        dependencies: ResolvedDependencies,
+        value: CapabilityValue,
+    ) -> Result<CapabilityHandle, ScopeError> {
         let instance = Arc::new(InstanceSlot {
             value,
-            dependencies,
+            dependencies: dependencies.clone(),
         });
 
         let (old, handle) = {
@@ -422,6 +517,28 @@ impl Scope {
                 .topology
                 .write()
                 .expect("scope topology lock poisoned");
+
+            // Re-read the exact dependency identities while holding the
+            // topology admission lock. A provider cannot replace between
+            // this check and publication, so an async initializer can never
+            // publish an old epoch after a concurrent replacement.
+            let current_dependencies = self.resolve_dependencies(&definition)?;
+            for dependency in &definition.dependencies {
+                let expected = dependencies
+                    .get(&dependency.id)
+                    .expect("validated dependency snapshot must contain every requirement");
+                let current = current_dependencies
+                    .get(&dependency.id)
+                    .expect("validated current dependencies must contain every requirement");
+                if current.generation() != expected.generation()
+                    || current.entry_id() != expected.entry_id()
+                {
+                    return Err(ScopeError::DependencyChanged {
+                        capability: definition.id.clone(),
+                        dependency: dependency.id.clone(),
+                    });
+                }
+            }
 
             self.validate_descendant_admission(&definition)?;
             let mut entries = self
@@ -531,7 +648,7 @@ impl Scope {
         Lifecycle::from_raw(self.state.lifecycle.load(Ordering::Acquire)) == Lifecycle::Open
     }
 
-    fn has_local(&self, id: &CapabilityId) -> bool {
+    fn has_local_entry(&self, id: &CapabilityId) -> bool {
         self.state
             .entries
             .read()
@@ -602,7 +719,7 @@ impl Scope {
             if Arc::ptr_eq(&current.state, &self.state) {
                 return true;
             }
-            if !current.is_open() || current.has_local(capability) {
+            if !current.is_open() || current.has_local_entry(capability) {
                 return false;
             }
             let Some(parent) = current.state.parent.as_ref() else {
@@ -805,6 +922,14 @@ pub enum ScopeError {
         /// Generation currently published.
         actual: Generation,
     },
+    /// An asynchronous initializer resolved a dependency snapshot that is no
+    /// longer the currently visible publication.
+    DependencyChanged {
+        /// Capability being initialized.
+        capability: CapabilityId,
+        /// Dependency whose exact entry changed.
+        dependency: CapabilityId,
+    },
     /// The local generation counter cannot advance further.
     GenerationExhausted {
         /// Capability whose generation counter is exhausted.
@@ -860,6 +985,13 @@ impl fmt::Display for ScopeError {
             } => write!(
                 f,
                 "replacement conflict for {capability}: expected generation {expected}, actual {actual}"
+            ),
+            Self::DependencyChanged {
+                capability,
+                dependency,
+            } => write!(
+                f,
+                "dependency {dependency} changed while initializing {capability}"
             ),
             Self::GenerationExhausted { capability } => {
                 write!(f, "generation exhausted for capability {capability}")

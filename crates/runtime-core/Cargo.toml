@@ -12,5 +12,8 @@ graph-core = { path = "../core" }
 workflow-graph = { path = "../workflow-graph" }
 workflow-recovery = { path = "../workflow-recovery" }
 
+[dev-dependencies]
+tokio = { version = "1.45", features = ["macros", "rt", "sync"] }
+
 [lints]
 workspace = true

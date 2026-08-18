@@ -1,0 +1,1267 @@
+//! Explicit Rust counterparts for the Cordis capability-runtime semantics.
+//!
+//! The module deliberately does not reproduce Cordis's proxy or prototype
+//! machinery. Context lookup, plugin identity, dependency epochs, and effect
+//! ownership are represented by ordinary Rust values and owned handles.
+
+use crate::{
+    CapabilityDefinition, CapabilityHandle, CapabilityId, CapabilityValue, Generation,
+    ResolvedDependencies, Scope, ScopeError,
+};
+use graph_core::Id;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Plugin configuration kept intentionally explicit at the kernel boundary.
+/// Applications can encode typed configuration at their own API boundary.
+pub type PluginConfig = String;
+
+/// A boxed asynchronous plugin factory result.
+pub type PluginFuture = Pin<Box<dyn Future<Output = Result<CapabilityValue, String>> + Send>>;
+
+/// A factory that initializes one plugin fiber.
+pub type PluginFactory = Arc<dyn Fn(PluginLoadContext) -> PluginFuture + Send + Sync>;
+
+/// Synchronous configuration validation performed before a fiber is created.
+pub type ConfigValidator = Arc<dyn Fn(&PluginConfig) -> Result<(), String> + Send + Sync>;
+
+/// Explicit context view used by plugin fibers.
+#[derive(Clone)]
+pub struct CapabilityContext {
+    state: Arc<ContextState>,
+}
+
+struct ContextState {
+    scope: Scope,
+    parent: Option<CapabilityContext>,
+    isolation: BTreeSet<CapabilityId>,
+    intercepts: BTreeMap<CapabilityId, PluginConfig>,
+}
+
+impl fmt::Debug for CapabilityContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapabilityContext")
+            .field("scope", &"owned capability scope")
+            .field("isolation", &self.state.isolation)
+            .field(
+                "intercepts",
+                &self.state.intercepts.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl CapabilityContext {
+    /// Creates an empty root context and root capability scope.
+    #[must_use]
+    pub fn root() -> Self {
+        Self::from_scope(Scope::root())
+    }
+
+    /// Wraps an existing scope without copying or changing its entries.
+    #[must_use]
+    pub fn from_scope(scope: Scope) -> Self {
+        Self {
+            state: Arc::new(ContextState {
+                scope,
+                parent: None,
+                isolation: BTreeSet::new(),
+                intercepts: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Returns the capability scope owned by this context view.
+    #[must_use]
+    pub fn scope(&self) -> &Scope {
+        &self.state.scope
+    }
+
+    /// Returns the root context in this explicit context chain.
+    #[must_use]
+    pub fn root_context(&self) -> Self {
+        let mut current = self.clone();
+        while let Some(parent) = current.state.parent.as_ref() {
+            current = parent.clone();
+        }
+        current
+    }
+
+    /// Creates a child with local storage and parent fallback.
+    #[must_use]
+    pub fn child_context(&self) -> Self {
+        Self {
+            state: Arc::new(ContextState {
+                scope: self.scope().child(),
+                parent: Some(self.clone()),
+                isolation: BTreeSet::new(),
+                intercepts: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Cordis-equivalent `extend`: create a child context without copying the
+    /// parent's local registrations.
+    #[must_use]
+    pub fn extend(&self) -> Self {
+        self.child_context()
+    }
+
+    /// Creates a child boundary that cannot fall back to the named parent
+    /// capability unless that capability is provided locally.
+    #[must_use]
+    pub fn isolate(&self, capability: CapabilityId) -> Self {
+        let scope = self.scope().child();
+        let mut isolation = BTreeSet::new();
+        isolation.insert(capability);
+        Self {
+            state: Arc::new(ContextState {
+                scope,
+                parent: Some(self.clone()),
+                isolation,
+                intercepts: BTreeMap::new(),
+            }),
+        }
+    }
+
+    /// Creates a child with a local configuration override for a plugin.
+    #[must_use]
+    pub fn intercept(&self, plugin: CapabilityId, config: PluginConfig) -> Self {
+        let scope = self.scope().child();
+        let mut intercepts = BTreeMap::new();
+        intercepts.insert(plugin, config);
+        Self {
+            state: Arc::new(ContextState {
+                scope,
+                parent: Some(self.clone()),
+                isolation: BTreeSet::new(),
+                intercepts,
+            }),
+        }
+    }
+
+    /// Resolves a capability with local-first, deterministic parent fallback.
+    #[must_use]
+    pub fn get(&self, id: &CapabilityId) -> Option<CapabilityHandle> {
+        let mut current = self.clone();
+        loop {
+            if current.scope().has_local(id) {
+                return current.scope().get(id);
+            }
+            if current.state.isolation.contains(id) {
+                return None;
+            }
+            current = current.state.parent.as_ref()?.clone();
+        }
+    }
+
+    /// Returns the nearest configuration override, if any.
+    #[must_use]
+    pub fn intercepted_config(&self, plugin: &CapabilityId) -> Option<PluginConfig> {
+        if let Some(config) = self.state.intercepts.get(plugin) {
+            return Some(config.clone());
+        }
+        self.state
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.intercepted_config(plugin))
+    }
+
+    /// Resolves exact dependency handles for a definition in this context.
+    pub(crate) fn resolve_dependencies(
+        &self,
+        definition: &CapabilityDefinition,
+    ) -> Result<ResolvedDependencies, ScopeError> {
+        let mut handles = BTreeMap::new();
+        for dependency in &definition.dependencies {
+            let handle = self
+                .get(&dependency.id)
+                .ok_or_else(|| ScopeError::MissingDependency {
+                    capability: definition.id.clone(),
+                    dependency: dependency.id.clone(),
+                })?;
+            handles.insert(dependency.id.clone(), handle);
+        }
+        Ok(ResolvedDependencies::from_handles(handles))
+    }
+
+    /// Publishes a synchronous local capability through the existing scope
+    /// admission boundary.
+    pub fn provide<F>(
+        &self,
+        definition: CapabilityDefinition,
+        construct: F,
+    ) -> Result<CapabilityHandle, ScopeError>
+    where
+        F: FnOnce(&ResolvedDependencies) -> Result<CapabilityValue, String>,
+    {
+        self.resolve_dependencies(&definition)?;
+        self.scope().provide(definition, construct)
+    }
+
+    /// Closes this context's scope and all descendant scopes.
+    pub fn teardown(&self) {
+        self.scope().teardown();
+    }
+}
+
+/// Exact dependency identity captured by one fiber epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyEpoch {
+    ordinal: u64,
+    pins: BTreeMap<CapabilityId, DependencyPin>,
+}
+
+/// One exact dependency generation retained by an epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DependencyPin {
+    generation: Generation,
+    entry_id: crate::EntryId,
+}
+
+impl DependencyEpoch {
+    fn from_dependencies(ordinal: u64, dependencies: &ResolvedDependencies) -> Self {
+        let pins = dependencies
+            .iter()
+            .map(|(id, handle)| {
+                (
+                    id.clone(),
+                    DependencyPin {
+                        generation: handle.generation(),
+                        entry_id: handle.entry_id(),
+                    },
+                )
+            })
+            .collect();
+        Self { ordinal, pins }
+    }
+
+    /// Returns the monotonic lifecycle epoch number.
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    /// Returns the exact generation pinned for a dependency.
+    #[must_use]
+    pub fn generation(&self, id: &CapabilityId) -> Option<Generation> {
+        self.pins.get(id).map(|pin| pin.generation)
+    }
+
+    /// Returns the exact entry identity pinned for a dependency.
+    #[must_use]
+    pub fn entry_id(&self, id: &CapabilityId) -> Option<crate::EntryId> {
+        self.pins.get(id).map(|pin| pin.entry_id)
+    }
+
+    /// Returns whether this epoch has no dependencies.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+}
+
+/// A plugin definition with explicit requirements and factory.
+#[derive(Clone)]
+pub struct PluginDefinition {
+    id: Id,
+    capability: CapabilityDefinition,
+    factory: PluginFactory,
+    validator: ConfigValidator,
+}
+
+impl fmt::Debug for PluginDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginDefinition")
+            .field("id", &self.id)
+            .field("capability", &self.capability)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PluginDefinition {
+    /// Creates a plugin definition. The capability definition's dependencies
+    /// are the plugin's explicit requirements.
+    #[must_use]
+    pub fn new(id: Id, capability: CapabilityDefinition, factory: PluginFactory) -> Self {
+        Self {
+            id,
+            capability,
+            factory,
+            validator: Arc::new(|_| Ok(())),
+        }
+    }
+
+    /// Adds a synchronous configuration validator.
+    #[must_use]
+    pub fn with_validator(mut self, validator: ConfigValidator) -> Self {
+        self.validator = validator;
+        self
+    }
+
+    /// Returns the logical plugin identity.
+    #[must_use]
+    pub const fn id(&self) -> &Id {
+        &self.id
+    }
+
+    /// Returns the capability definition published by each active fiber.
+    #[must_use]
+    pub const fn capability(&self) -> &CapabilityDefinition {
+        &self.capability
+    }
+}
+
+/// A plugin runtime metadata entry shared by multiple fibers.
+pub struct PluginRuntime {
+    definition: Arc<PluginDefinition>,
+    fibers: Mutex<BTreeMap<FiberId, Weak<CapabilityFiber>>>,
+    next_fiber: AtomicU64,
+}
+
+impl fmt::Debug for PluginRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginRuntime")
+            .field("id", self.id())
+            .field("fiber_count", &self.fiber_count())
+            .finish()
+    }
+}
+
+impl PluginRuntime {
+    /// Creates runtime metadata for one logical plugin identity.
+    #[must_use]
+    pub fn new(definition: PluginDefinition) -> Arc<Self> {
+        Arc::new(Self {
+            definition: Arc::new(definition),
+            fibers: Mutex::new(BTreeMap::new()),
+            next_fiber: AtomicU64::new(1),
+        })
+    }
+
+    /// Returns the logical plugin identity.
+    #[must_use]
+    pub fn id(&self) -> &Id {
+        self.definition.id()
+    }
+
+    /// Returns the shared plugin definition.
+    #[must_use]
+    pub fn definition(&self) -> &PluginDefinition {
+        &self.definition
+    }
+
+    /// Returns the number of live fiber instances.
+    #[must_use]
+    pub fn fiber_count(&self) -> usize {
+        let mut fibers = self.fibers.lock().expect("plugin fiber lock poisoned");
+        fibers.retain(|_, fiber| fiber.strong_count() != 0);
+        fibers.len()
+    }
+
+    fn create_fiber(
+        self: &Arc<Self>,
+        context: CapabilityContext,
+        config: PluginConfig,
+    ) -> Result<Arc<CapabilityFiber>, FiberError> {
+        (self.definition.validator)(&config).map_err(|reason| FiberError::InvalidConfig {
+            plugin: self.id().clone(),
+            reason,
+        })?;
+        let raw_id = self
+            .next_fiber
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| FiberError::FiberIdExhausted)?;
+        let fiber = Arc::new(CapabilityFiber::new(
+            FiberId(raw_id),
+            Arc::downgrade(self),
+            context,
+            Arc::clone(&self.definition),
+            config,
+        ));
+        self.fibers
+            .lock()
+            .expect("plugin fiber lock poisoned")
+            .insert(fiber.id(), Arc::downgrade(&fiber));
+        Ok(fiber)
+    }
+
+    fn remove_fiber(&self, id: FiberId) {
+        self.fibers
+            .lock()
+            .expect("plugin fiber lock poisoned")
+            .remove(&id);
+    }
+
+    async fn dispose_fibers(&self) -> Vec<FiberError> {
+        let fibers = self
+            .fibers
+            .lock()
+            .expect("plugin fiber lock poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for fiber in fibers {
+            if let Err(error) = fiber.dispose().await {
+                errors.push(error);
+            }
+        }
+        self.fibers
+            .lock()
+            .expect("plugin fiber lock poisoned")
+            .clear();
+        errors
+    }
+}
+
+/// Registry of logical plugin runtimes.
+#[derive(Debug, Default)]
+pub struct CapabilityRegistry {
+    runtimes: Mutex<BTreeMap<Id, Arc<PluginRuntime>>>,
+}
+
+impl CapabilityRegistry {
+    /// Creates an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one logical runtime. Duplicate identity fails closed.
+    pub fn register(&self, runtime: Arc<PluginRuntime>) -> Result<(), RegistryError> {
+        let mut runtimes = self.runtimes.lock().expect("plugin registry lock poisoned");
+        if runtimes.contains_key(runtime.id()) {
+            return Err(RegistryError::Duplicate(runtime.id().clone()));
+        }
+        runtimes.insert(runtime.id().clone(), runtime);
+        Ok(())
+    }
+
+    /// Returns a runtime metadata entry without granting disposal authority.
+    #[must_use]
+    pub fn get(&self, id: &Id) -> Option<Arc<PluginRuntime>> {
+        self.runtimes
+            .lock()
+            .expect("plugin registry lock poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    /// Returns whether a logical plugin is registered.
+    #[must_use]
+    pub fn contains(&self, id: &Id) -> bool {
+        self.runtimes
+            .lock()
+            .expect("plugin registry lock poisoned")
+            .contains_key(id)
+    }
+
+    /// Returns the number of logical plugin runtimes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.runtimes
+            .lock()
+            .expect("plugin registry lock poisoned")
+            .len()
+    }
+
+    /// Returns whether no logical plugin runtimes are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Creates one fiber for a registered runtime. Multiple calls retain one
+    /// runtime metadata record and produce separate lifecycle instances.
+    pub fn instantiate(
+        &self,
+        id: &Id,
+        context: CapabilityContext,
+        config: PluginConfig,
+    ) -> Result<Arc<CapabilityFiber>, RegistryError> {
+        let runtime = self
+            .get(id)
+            .ok_or_else(|| RegistryError::Unknown(id.clone()))?;
+        runtime
+            .create_fiber(context, config)
+            .map_err(RegistryError::Fiber)
+    }
+
+    /// Removes a runtime and disposes all associated fibers.
+    pub async fn remove(&self, id: &Id) -> Result<Option<Arc<PluginRuntime>>, RegistryError> {
+        let runtime = self
+            .runtimes
+            .lock()
+            .expect("plugin registry lock poisoned")
+            .remove(id);
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let errors = runtime.dispose_fibers().await;
+        if errors.is_empty() {
+            Ok(Some(runtime))
+        } else {
+            Err(RegistryError::Dispose {
+                plugin: id.clone(),
+                errors,
+            })
+        }
+    }
+}
+
+/// Monotonic identity for one plugin fiber instance.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FiberId(u64);
+
+impl FiberId {
+    /// Returns the process-local numeric identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Cordis-compatible semantic state names, represented explicitly.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FiberState {
+    /// Requirements are not currently satisfied or the fiber has not started.
+    Pending,
+    /// Plugin initialization is in progress.
+    Loading,
+    /// The plugin value and effects are published.
+    Active,
+    /// Initialization failed and requires explicit restart/update.
+    Failed,
+    /// Cleanup is in progress.
+    Unloading,
+    /// Final state after explicit disposal.
+    Disposed,
+}
+
+impl FiberState {
+    fn as_raw(self) -> u8 {
+        self as u8
+    }
+
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Pending,
+            1 => Self::Loading,
+            2 => Self::Active,
+            3 => Self::Failed,
+            4 => Self::Unloading,
+            _ => Self::Disposed,
+        }
+    }
+}
+
+/// A context passed to one plugin initialization attempt.
+#[derive(Clone)]
+pub struct PluginLoadContext {
+    context: CapabilityContext,
+    config: PluginConfig,
+    dependencies: ResolvedDependencies,
+    effects: EffectScope,
+}
+
+impl fmt::Debug for PluginLoadContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PluginLoadContext")
+            .field("config", &self.config)
+            .field("dependencies", &self.dependencies.len())
+            .finish()
+    }
+}
+
+impl PluginLoadContext {
+    fn new(
+        context: CapabilityContext,
+        config: PluginConfig,
+        dependencies: ResolvedDependencies,
+        effects: EffectScope,
+    ) -> Self {
+        Self {
+            context,
+            config,
+            dependencies,
+            effects,
+        }
+    }
+
+    /// Returns the context view for this attempt.
+    #[must_use]
+    pub fn context(&self) -> &CapabilityContext {
+        &self.context
+    }
+
+    /// Returns the validated/effective configuration.
+    #[must_use]
+    pub fn config(&self) -> &str {
+        &self.config
+    }
+
+    /// Returns the exact dependency snapshot for this attempt.
+    #[must_use]
+    pub fn dependencies(&self) -> &ResolvedDependencies {
+        &self.dependencies
+    }
+
+    /// Returns the effect owner for resources created by this attempt.
+    #[must_use]
+    pub fn effects(&self) -> &EffectScope {
+        &self.effects
+    }
+
+    /// Registers an effect owned by the current fiber epoch.
+    pub fn effect(&self, effect: ScopedEffect) -> Result<(), EffectError> {
+        self.effects.register(effect)
+    }
+}
+
+/// A process-local capability fiber with serialized load/unload transitions.
+pub struct CapabilityFiber {
+    id: FiberId,
+    runtime: Weak<PluginRuntime>,
+    context: CapabilityContext,
+    definition: Arc<PluginDefinition>,
+    config: Mutex<PluginConfig>,
+    state: AtomicU8,
+    requested_epoch: AtomicU64,
+    dispose_requested: AtomicBool,
+    force_reload: AtomicBool,
+    transition: AsyncMutex<()>,
+    handle: AsyncMutex<Option<CapabilityHandle>>,
+    dependency_epoch: AsyncMutex<Option<DependencyEpoch>>,
+    effects: Mutex<EffectScope>,
+    last_cleanup_errors: AsyncMutex<Vec<EffectError>>,
+    error: AsyncMutex<Option<String>>,
+}
+
+impl fmt::Debug for CapabilityFiber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CapabilityFiber")
+            .field("id", &self.id)
+            .field("plugin", self.definition.id())
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl CapabilityFiber {
+    fn new(
+        id: FiberId,
+        runtime: Weak<PluginRuntime>,
+        context: CapabilityContext,
+        definition: Arc<PluginDefinition>,
+        config: PluginConfig,
+    ) -> Self {
+        Self {
+            id,
+            runtime,
+            context,
+            definition,
+            config: Mutex::new(config),
+            state: AtomicU8::new(FiberState::Pending.as_raw()),
+            requested_epoch: AtomicU64::new(0),
+            dispose_requested: AtomicBool::new(false),
+            force_reload: AtomicBool::new(false),
+            transition: AsyncMutex::new(()),
+            handle: AsyncMutex::new(None),
+            dependency_epoch: AsyncMutex::new(None),
+            effects: Mutex::new(EffectScope::new()),
+            last_cleanup_errors: AsyncMutex::new(Vec::new()),
+            error: AsyncMutex::new(None),
+        }
+    }
+
+    /// Returns this fiber's process-local identity.
+    #[must_use]
+    pub const fn id(&self) -> FiberId {
+        self.id
+    }
+
+    /// Returns the logical plugin identity.
+    #[must_use]
+    pub fn plugin_id(&self) -> &Id {
+        self.definition.id()
+    }
+
+    /// Returns the context used for future dependency resolution.
+    #[must_use]
+    pub fn context(&self) -> &CapabilityContext {
+        &self.context
+    }
+
+    /// Returns the current state without requiring an async borrow.
+    #[must_use]
+    pub fn state(&self) -> FiberState {
+        FiberState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    /// Returns the latest initialization error, if any.
+    pub async fn error(&self) -> Option<String> {
+        self.error.lock().await.clone()
+    }
+
+    /// Returns the last cleanup errors. Cleanup always continues after one
+    /// disposer fails, so callers can inspect all isolated failures.
+    pub async fn cleanup_errors(&self) -> Vec<EffectError> {
+        self.last_cleanup_errors.lock().await.clone()
+    }
+
+    /// Returns the currently published exact capability handle.
+    pub async fn handle(&self) -> Option<CapabilityHandle> {
+        self.handle.lock().await.clone()
+    }
+
+    /// Returns the current dependency epoch after a stable transition.
+    pub async fn dependency_epoch(&self) -> Option<DependencyEpoch> {
+        self.dependency_epoch.lock().await.clone()
+    }
+
+    /// Registers an effect against the current fiber epoch.
+    pub fn effect(&self, effect: ScopedEffect) -> Result<(), FiberError> {
+        match self.state() {
+            FiberState::Unloading | FiberState::Disposed => {
+                Err(FiberError::InactiveEffect(self.state()))
+            }
+            _ => self
+                .effects
+                .lock()
+                .expect("fiber effect lock poisoned")
+                .register(effect)
+                .map_err(FiberError::Effect),
+        }
+    }
+
+    /// Marks a possible dependency change. The next stable operation observes
+    /// the exact visible handles again; no fiber is replaced to escape a race.
+    pub fn notify_dependency_change(&self) {
+        self.requested_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Loads the fiber when requirements are satisfied, or leaves it pending
+    /// when a requirement is absent.
+    pub async fn start(&self) -> Result<FiberState, FiberError> {
+        let _transition = self.transition.lock().await;
+        self.drive(false).await
+    }
+
+    /// Unloads and reloads the same fiber instance with its current config.
+    pub async fn restart(&self) -> Result<FiberState, FiberError> {
+        if self.state() == FiberState::Disposed {
+            return Err(FiberError::Disposed);
+        }
+        self.force_reload.store(true, Ordering::Release);
+        self.requested_epoch.fetch_add(1, Ordering::AcqRel);
+        let _transition = self.transition.lock().await;
+        self.drive(true).await
+    }
+
+    /// Validates and updates config, then restarts the same fiber.
+    pub async fn update(&self, config: PluginConfig) -> Result<FiberState, FiberError> {
+        if self.state() == FiberState::Disposed {
+            return Err(FiberError::Disposed);
+        }
+        (self.definition.validator)(&config).map_err(|reason| FiberError::InvalidConfig {
+            plugin: self.plugin_id().clone(),
+            reason,
+        })?;
+        *self.config.lock().expect("fiber config lock poisoned") = config;
+        self.restart().await
+    }
+
+    /// Waits for one load/unload transition to reach a stable state.
+    pub async fn await_stable(&self) -> Result<FiberState, FiberError> {
+        self.start().await
+    }
+
+    /// Disposes this fiber exactly once and waits for external async cleanup.
+    pub async fn dispose(&self) -> Result<(), FiberError> {
+        self.dispose_requested.store(true, Ordering::Release);
+        self.requested_epoch.fetch_add(1, Ordering::AcqRel);
+        let _transition = self.transition.lock().await;
+        if self.state() == FiberState::Disposed {
+            return Ok(());
+        }
+        let cleanup_errors = self.unload().await;
+        self.set_state(FiberState::Disposed);
+        if let Some(runtime) = self.runtime.upgrade() {
+            runtime.remove_fiber(self.id);
+        }
+        if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(FiberError::Cleanup(cleanup_errors))
+        }
+    }
+
+    async fn drive(&self, force: bool) -> Result<FiberState, FiberError> {
+        if self.dispose_requested.load(Ordering::Acquire) {
+            return Err(FiberError::Disposed);
+        }
+        if !force && self.state() == FiberState::Failed {
+            let reason = self
+                .error
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_else(|| "plugin initialization failed".to_owned());
+            return Err(FiberError::InitializationFailed {
+                plugin: self.plugin_id().clone(),
+                reason,
+                cleanup_errors: self.cleanup_errors().await,
+            });
+        }
+        let force = force || self.force_reload.swap(false, Ordering::AcqRel);
+
+        loop {
+            let dependencies = match self
+                .context
+                .resolve_dependencies(&self.definition.capability)
+            {
+                Ok(dependencies) => dependencies,
+                Err(ScopeError::MissingDependency { .. }) => {
+                    self.clear_active_state().await;
+                    self.set_state(FiberState::Pending);
+                    return Ok(FiberState::Pending);
+                }
+                Err(error) => return Err(FiberError::Scope(error)),
+            };
+            let epoch = DependencyEpoch::from_dependencies(
+                self.requested_epoch.load(Ordering::Acquire),
+                &dependencies,
+            );
+
+            let active_matches = if !force && self.state() == FiberState::Active {
+                self.dependency_epoch().await.as_ref() == Some(&epoch)
+            } else {
+                false
+            };
+            if active_matches {
+                return Ok(FiberState::Active);
+            }
+
+            if matches!(self.state(), FiberState::Active | FiberState::Failed) {
+                let errors = self.unload().await;
+                if !errors.is_empty() {
+                    *self.last_cleanup_errors.lock().await = errors;
+                }
+                if self.dispose_requested.load(Ordering::Acquire) {
+                    return Err(FiberError::Disposed);
+                }
+                continue;
+            }
+            if self.dispose_requested.load(Ordering::Acquire) {
+                return Err(FiberError::Disposed);
+            }
+
+            self.set_state(FiberState::Loading);
+            let token = self.requested_epoch.load(Ordering::Acquire);
+            let config = self
+                .context
+                .intercepted_config(self.plugin_id())
+                .unwrap_or_else(|| {
+                    self.config
+                        .lock()
+                        .expect("fiber config lock poisoned")
+                        .clone()
+                });
+            let effects = EffectScope::new();
+            *self.effects.lock().expect("fiber effect lock poisoned") = effects.clone();
+            *self.error.lock().await = None;
+            let load_context = PluginLoadContext::new(
+                self.context.clone(),
+                config,
+                dependencies.clone(),
+                effects.clone(),
+            );
+            let result = (self.definition.factory)(load_context).await;
+
+            let current_dependencies = self
+                .context
+                .resolve_dependencies(&self.definition.capability);
+            let stale = self.dispose_requested.load(Ordering::Acquire)
+                || self.requested_epoch.load(Ordering::Acquire) != token
+                || current_dependencies
+                    .as_ref()
+                    .ok()
+                    .map(|current| DependencyEpoch::from_dependencies(token, current) != epoch)
+                    != Some(false);
+            match result {
+                Ok(value) if !stale => {
+                    match self.context.scope().provide_value(
+                        self.definition.capability.clone(),
+                        dependencies.clone(),
+                        value,
+                    ) {
+                        Ok(handle) => {
+                            *self.handle.lock().await = Some(handle);
+                            *self.dependency_epoch.lock().await = Some(epoch);
+                            self.set_state(FiberState::Active);
+                            return Ok(FiberState::Active);
+                        }
+                        Err(ScopeError::DependencyChanged { .. }) => {
+                            let errors = effects.dispose_all().await;
+                            *self.last_cleanup_errors.lock().await = errors;
+                            self.set_state(FiberState::Pending);
+                        }
+                        Err(error) => {
+                            let errors = effects.dispose_all().await;
+                            *self.error.lock().await = Some(error.to_string());
+                            *self.last_cleanup_errors.lock().await = errors.clone();
+                            self.set_state(FiberState::Failed);
+                            return Err(FiberError::Scope(error));
+                        }
+                    }
+                }
+                Ok(value) => {
+                    drop(value);
+                    let errors = effects.dispose_all().await;
+                    *self.last_cleanup_errors.lock().await = errors;
+                    if self.dispose_requested.load(Ordering::Acquire) {
+                        return Err(FiberError::Disposed);
+                    }
+                    self.set_state(FiberState::Pending);
+                }
+                Err(reason) => {
+                    let errors = effects.dispose_all().await;
+                    *self.error.lock().await = Some(reason.clone());
+                    *self.last_cleanup_errors.lock().await = errors.clone();
+                    self.set_state(FiberState::Failed);
+                    return Err(FiberError::InitializationFailed {
+                        plugin: self.plugin_id().clone(),
+                        reason,
+                        cleanup_errors: errors,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn clear_active_state(&self) {
+        if self.state() == FiberState::Active {
+            let errors = self.unload().await;
+            *self.last_cleanup_errors.lock().await = errors;
+        }
+    }
+
+    async fn unload(&self) -> Vec<EffectError> {
+        self.set_state(FiberState::Unloading);
+        let effects = self
+            .effects
+            .lock()
+            .expect("fiber effect lock poisoned")
+            .clone();
+        let errors = effects.dispose_all().await;
+        if let Some(handle) = self.handle.lock().await.take() {
+            let generation = handle.generation();
+            if let Err(error) = self.context.scope().remove_local(handle.id(), generation) {
+                let mut all = errors;
+                all.push(EffectError::from_scope(error));
+                *self.dependency_epoch.lock().await = None;
+                self.set_state(FiberState::Pending);
+                return all;
+            }
+        }
+        *self.dependency_epoch.lock().await = None;
+        *self.effects.lock().expect("fiber effect lock poisoned") = EffectScope::new();
+        self.set_state(FiberState::Pending);
+        errors
+    }
+
+    fn set_state(&self, state: FiberState) {
+        self.state.store(state.as_raw(), Ordering::Release);
+    }
+}
+
+/// An owned effect registration.
+pub struct ScopedEffect {
+    label: String,
+    disposer: Option<Box<dyn FnOnce() -> EffectFuture + Send>>,
+}
+
+impl fmt::Debug for ScopedEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopedEffect")
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+impl ScopedEffect {
+    /// Creates an effect with a synchronous disposer.
+    #[must_use]
+    pub fn sync(
+        label: impl Into<String>,
+        disposer: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            disposer: Some(Box::new(move || Box::pin(async move { disposer() }))),
+        }
+    }
+
+    /// Creates an effect with an asynchronous disposer.
+    #[must_use]
+    pub fn asynchronous<F, Fut>(label: impl Into<String>, disposer: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self {
+            label: label.into(),
+            disposer: Some(Box::new(move || Box::pin(disposer()))),
+        }
+    }
+}
+
+type EffectFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// A reverse-order stack of owned effects.
+#[derive(Debug, Default)]
+pub struct EffectStack {
+    effects: Vec<ScopedEffect>,
+    closed: bool,
+}
+
+impl EffectStack {
+    /// Creates an open stack.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            effects: Vec::new(),
+            closed: false,
+        }
+    }
+
+    /// Registers one effect unless the stack has begun disposal.
+    pub fn push(&mut self, effect: ScopedEffect) -> Result<(), EffectError> {
+        if self.closed {
+            return Err(EffectError::Closed);
+        }
+        self.effects.push(effect);
+        Ok(())
+    }
+
+    /// Disposes all effects in reverse registration order and continues after
+    /// failures.
+    pub async fn dispose_all(&mut self) -> Vec<EffectError> {
+        self.closed = true;
+        let effects = std::mem::take(&mut self.effects);
+        run_effects(effects).await
+    }
+}
+
+async fn run_effects(mut effects: Vec<ScopedEffect>) -> Vec<EffectError> {
+    let mut errors = Vec::new();
+    while let Some(mut effect) = effects.pop() {
+        if let Some(disposer) = effect.disposer.take() {
+            if let Err(reason) = disposer().await {
+                errors.push(EffectError::Disposer {
+                    label: effect.label,
+                    reason,
+                });
+            }
+        }
+    }
+    errors
+}
+
+/// A cloneable owner view used by a loading fiber and nested effects.
+#[derive(Clone, Debug)]
+pub struct EffectScope {
+    stack: Arc<Mutex<EffectStack>>,
+}
+
+impl EffectScope {
+    /// Creates an open effect scope.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stack: Arc::new(Mutex::new(EffectStack::new())),
+        }
+    }
+
+    /// Registers an effect in this scope.
+    pub fn register(&self, effect: ScopedEffect) -> Result<(), EffectError> {
+        self.stack
+            .lock()
+            .expect("effect stack lock poisoned")
+            .push(effect)
+    }
+
+    /// Creates a child scope owned by this scope.
+    pub fn child(&self, label: impl Into<String>) -> Result<Self, EffectError> {
+        let child = Self::new();
+        let owned = child.clone();
+        self.register(ScopedEffect::asynchronous(label, move || async move {
+            let errors = owned.dispose_all().await;
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "nested effect cleanup failed: {} error(s)",
+                    errors.len()
+                ))
+            }
+        }))?;
+        Ok(child)
+    }
+
+    /// Disposes the shared scope once; repeated calls see an empty stack.
+    pub async fn dispose_all(&self) -> Vec<EffectError> {
+        let mut effects = {
+            let mut stack = self.stack.lock().expect("effect stack lock poisoned");
+            stack.closed = true;
+            std::mem::take(&mut stack.effects)
+        };
+        run_effects(std::mem::take(&mut effects)).await
+    }
+}
+
+impl Default for EffectScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Errors from effect registration or cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EffectError {
+    /// A new effect was registered after cleanup began.
+    Closed,
+    /// One disposer failed; remaining disposers still run.
+    Disposer {
+        /// Human-readable effect label.
+        label: String,
+        /// Disposer-provided failure description.
+        reason: String,
+    },
+    /// Scope ownership cleanup surfaced a scope error.
+    Scope(String),
+}
+
+impl EffectError {
+    fn from_scope(error: ScopeError) -> Self {
+        Self::Scope(error.to_string())
+    }
+}
+
+impl fmt::Display for EffectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed => f.write_str("effect scope is closed"),
+            Self::Disposer { label, reason } => {
+                write!(f, "effect {label} cleanup failed: {reason}")
+            }
+            Self::Scope(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for EffectError {}
+
+/// Fiber lifecycle failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FiberError {
+    /// The fiber has reached its final state.
+    Disposed,
+    /// A plugin configuration was rejected before startup.
+    InvalidConfig {
+        /// Logical plugin identity whose config was rejected.
+        plugin: Id,
+        /// Validator-provided failure description.
+        reason: String,
+    },
+    /// Plugin initialization failed after partial effect setup.
+    InitializationFailed {
+        /// Logical plugin identity whose initialization failed.
+        plugin: Id,
+        /// Factory-provided failure description.
+        reason: String,
+        /// Cleanup failures collected after partial initialization.
+        cleanup_errors: Vec<EffectError>,
+    },
+    /// Existing capability graph admission rejected publication.
+    Scope(ScopeError),
+    /// An effect was attempted during unload or after disposal.
+    InactiveEffect(FiberState),
+    /// The process-local fiber counter is exhausted.
+    FiberIdExhausted,
+    /// A cleanup failure occurred while disposing a fiber.
+    Cleanup(Vec<EffectError>),
+    /// An effect registration failed.
+    Effect(EffectError),
+}
+
+impl fmt::Display for FiberError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disposed => f.write_str("fiber is disposed"),
+            Self::InvalidConfig { plugin, reason } => {
+                write!(f, "invalid config for plugin {plugin}: {reason}")
+            }
+            Self::InitializationFailed { plugin, reason, .. } => {
+                write!(f, "plugin {plugin} initialization failed: {reason}")
+            }
+            Self::Scope(error) => error.fmt(f),
+            Self::InactiveEffect(state) => {
+                write!(f, "cannot create effect while fiber is {state:?}")
+            }
+            Self::FiberIdExhausted => f.write_str("fiber id exhausted"),
+            Self::Cleanup(errors) => {
+                write!(f, "fiber cleanup failed with {} error(s)", errors.len())
+            }
+            Self::Effect(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FiberError {}
+
+/// Registry failures.
+#[derive(Debug)]
+pub enum RegistryError {
+    /// The logical plugin identity is already registered.
+    Duplicate(Id),
+    /// No runtime exists for the requested identity.
+    Unknown(Id),
+    /// Fiber creation failed.
+    Fiber(FiberError),
+    /// Runtime removal disposed fibers with one or more cleanup errors.
+    Dispose {
+        /// Logical plugin identity being removed.
+        plugin: Id,
+        /// Fiber disposal failures collected for the runtime.
+        errors: Vec<FiberError>,
+    },
+}
+
+impl fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(id) => write!(f, "plugin runtime already registered: {id}"),
+            Self::Unknown(id) => write!(f, "unknown plugin runtime: {id}"),
+            Self::Fiber(error) => error.fmt(f),
+            Self::Dispose { plugin, errors } => {
+                write!(
+                    f,
+                    "disposing plugin {plugin} failed with {} error(s)",
+                    errors.len()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
