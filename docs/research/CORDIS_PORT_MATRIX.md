@@ -1,6 +1,17 @@
 # Cordis Port Matrix
 
-Status: M2-A Stage 1 contract
+Status: M2-A Integrated
+
+## M2-A closeout
+
+- Code candidate: `2e148d816e4a1390f08c02114ea0904f1685e793`.
+- Independent semantic review: PASS, 0 blockers.
+- Candidate branch CI: run `32108287390`, PASS.
+- Integrated main CI: run `32110400912`, PASS.
+- Cordis baseline: `cordiverse/cordis` commit
+  `8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4`.
+- Known follow-ups: M2-B0 durability reference mapping and durable-state
+  boundary design; persistence implementation remains out of scope.
 
 This matrix freezes the reference used for the semantic port. “PORT” means
 the behavioral invariant is implemented in Rust with an explicit Rust API;

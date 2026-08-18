@@ -1,5 +1,7 @@
 # M2-B Handoff: Durable Runtime Extension
 
+Status: M2-A integrated; M2-B0 not started
+
 M2-A keeps Cordis-derived Context, Registry, Fiber, and Effect state
 process-local. The next milestone must persist authoritative facts without
 serializing the in-memory Fiber object graph.
