@@ -425,9 +425,49 @@ fn lossless_lifecycle_backpressure_retains_event_for_retry() {
         Err(RuntimeError::ExecutionBackpressure { item }) => item,
         other => panic!("expected retained lifecycle item, got {other:?}"),
     };
+    assert_eq!(runtime.attempts().len(), 64);
+    match runtime.step() {
+        Err(RuntimeError::ExecutionBackpressure { item: retry_item }) => {
+            assert_eq!(retry_item, item);
+        }
+        other => panic!("expected the pending start to remain blocked, got {other:?}"),
+    }
     assert_eq!(runtime.drain_execution_events().len(), 128);
     runtime
         .retry_execution_event(item)
         .expect("drained lossless stream accepts the original item");
+    let retried = runtime.drain_execution_events();
+    assert_eq!(retried.len(), 1);
+    let retried_attempt_id = match &retried[0].payload {
+        runtime_core::RuntimeEvent::TaskStarted {
+            task_id,
+            attempt_id,
+            ..
+        } => {
+            assert_eq!(task_id, &id("task-64"));
+            attempt_id.clone()
+        }
+        other => panic!("expected the retained start event, got {other:?}"),
+    };
+    assert_eq!(runtime.attempts().len(), 65);
+    let task_attempts = runtime
+        .attempts()
+        .iter()
+        .filter(|attempt| attempt.task_id == id("task-64"))
+        .collect::<Vec<_>>();
+    assert_eq!(task_attempts.len(), 1);
+    assert_eq!(task_attempts[0].attempt_id, retried_attempt_id);
+
+    match runtime.step().expect("the retried task resumes") {
+        StepResult::Completed {
+            task_id,
+            attempt_id,
+        } => {
+            assert_eq!(task_id, id("task-64"));
+            assert_eq!(attempt_id, retried_attempt_id);
+        }
+        other => panic!("expected the retried task to complete, got {other:?}"),
+    }
+    assert_eq!(runtime.attempts().len(), 65);
     assert_eq!(runtime.drain_execution_events().len(), 1);
 }

@@ -350,6 +350,7 @@ pub struct Runtime {
     journal: DurableJournal,
     task_configs: BTreeMap<Id, TaskConfig>,
     attempts: Vec<TaskAttempt>,
+    pending_started: Option<(TaskAttempt, StreamItem<RuntimeEvent>)>,
     cancelled: BTreeSet<Id>,
     next_attempt_number: u64,
     execution_sequencer: StreamSequencer,
@@ -389,6 +390,7 @@ impl Runtime {
             journal: DurableJournal::new(),
             task_configs: configs,
             attempts: Vec::new(),
+            pending_started: None,
             cancelled: BTreeSet::new(),
             next_attempt_number: 1,
             execution_sequencer: StreamSequencer::new(stream_id("runtime-events")),
@@ -600,6 +602,9 @@ impl Runtime {
 
     /// Executes the lexicographically first ready, non-cancelled task.
     pub fn step(&mut self) -> Result<StepResult, RuntimeError> {
+        if let Some((_, item)) = &self.pending_started {
+            return Err(RuntimeError::ExecutionBackpressure { item: item.clone() });
+        }
         for task_id in self.workflow.ready_tasks() {
             if self.cancelled.contains(&task_id) {
                 continue;
@@ -642,6 +647,19 @@ impl Runtime {
         &mut self,
         item: StreamItem<RuntimeEvent>,
     ) -> Result<(), RuntimeError> {
+        if let Some((attempt, pending_item)) = self.pending_started.take() {
+            let retry_item = pending_item.clone();
+            return match self.enqueue_execution(pending_item) {
+                Ok(()) => {
+                    self.attempts.push(attempt);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.pending_started = Some((attempt, retry_item));
+                    Err(error)
+                }
+            };
+        }
         self.enqueue_execution(item)
     }
 
@@ -658,7 +676,9 @@ impl Runtime {
     fn step_task(&mut self, task_id: Id) -> Result<StepResult, RuntimeError> {
         let operation = self.ensure_configured_effect(&task_id)?;
         let Some((operation_id, _semantics)) = operation else {
-            let attempt_id = self.begin_attempt(&task_id, None)?;
+            let attempt_id = self
+                .attempt_for_task(&task_id, None)
+                .map_or_else(|| self.begin_attempt(&task_id, None), Ok)?;
             self.workflow.complete(&task_id)?;
             self.emit_completed(task_id.clone(), attempt_id.clone())?;
             return Ok(StepResult::Completed {
@@ -776,34 +796,55 @@ impl Runtime {
             .ok_or(RuntimeError::AttemptIdExhausted)?;
         let attempt_id = AttemptId::new(format!("{}-attempt-{attempt_number}", self.run_id))
             .expect("generated attempt identity is non-empty");
-        self.emit_started(task_id.clone(), attempt_id.clone())?;
-        self.attempts.push(TaskAttempt {
+        let attempt = TaskAttempt {
             run_id: self.run_id.clone(),
             task_id: task_id.clone(),
             attempt_id: attempt_id.clone(),
             operation_id,
             capability_pins,
-        });
-        Ok(attempt_id)
+        };
+        let item = self.execution_sequencer.emit(RuntimeEvent::TaskStarted {
+            run_id: self.run_id.clone(),
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+        })?;
+        match self.enqueue_execution(item) {
+            Ok(()) => {
+                self.attempts.push(attempt);
+                Ok(attempt_id)
+            }
+            Err(RuntimeError::ExecutionBackpressure { item }) => {
+                self.pending_started = Some((attempt, item.clone()));
+                Err(RuntimeError::ExecutionBackpressure { item })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn pending_attempt(&self, task_id: &Id, operation_id: &OperationId) -> Option<AttemptId> {
-        self.attempts
-            .iter()
-            .rev()
-            .find(|attempt| {
-                &attempt.task_id == task_id && attempt.operation_id.as_ref() == Some(operation_id)
-            })
-            .map(|attempt| attempt.attempt_id.clone())
+        self.attempt_for_task(task_id, Some(operation_id))
     }
 
-    fn emit_started(&mut self, task_id: Id, attempt_id: AttemptId) -> Result<(), RuntimeError> {
-        let item = self.execution_sequencer.emit(RuntimeEvent::TaskStarted {
-            run_id: self.run_id.clone(),
-            task_id,
-            attempt_id,
-        })?;
-        self.enqueue_execution(item)
+    fn attempt_for_task(
+        &self,
+        task_id: &Id,
+        operation_id: Option<&OperationId>,
+    ) -> Option<AttemptId> {
+        self.pending_started
+            .as_ref()
+            .filter(|(attempt, _)| {
+                &attempt.task_id == task_id && attempt.operation_id.as_ref() == operation_id
+            })
+            .map(|(attempt, _)| attempt.attempt_id.clone())
+            .or_else(|| {
+                self.attempts
+                    .iter()
+                    .rev()
+                    .find(|attempt| {
+                        &attempt.task_id == task_id && attempt.operation_id.as_ref() == operation_id
+                    })
+                    .map(|attempt| attempt.attempt_id.clone())
+            })
     }
 
     fn emit_completed(&mut self, task_id: Id, attempt_id: AttemptId) -> Result<(), RuntimeError> {
