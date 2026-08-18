@@ -404,3 +404,30 @@ fn cancellation_after_dispatch_preserves_unknown_effect_fact() {
     );
     assert_eq!(runtime.workflow().completed_tasks().len(), 0);
 }
+
+#[test]
+fn lossless_lifecycle_backpressure_retains_event_for_retry() {
+    let mutations = (0..65)
+        .map(|index| WorkflowMutation::AddTask {
+            task: task(&format!("task-{index:02}")),
+        })
+        .collect::<Vec<_>>();
+    let mut runtime = start(workflow(mutations), Scope::root(), []);
+
+    for _ in 0..64 {
+        assert!(matches!(
+            runtime.step().expect("lifecycle events fit"),
+            StepResult::Completed { .. }
+        ));
+    }
+
+    let item = match runtime.step() {
+        Err(RuntimeError::ExecutionBackpressure { item }) => item,
+        other => panic!("expected retained lifecycle item, got {other:?}"),
+    };
+    assert_eq!(runtime.drain_execution_events().len(), 128);
+    runtime
+        .retry_execution_event(item)
+        .expect("drained lossless stream accepts the original item");
+    assert_eq!(runtime.drain_execution_events().len(), 1);
+}

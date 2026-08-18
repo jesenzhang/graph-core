@@ -531,6 +531,34 @@ fn same_operation_can_have_multiple_attempts() {
 }
 
 #[test]
+fn late_older_attempt_outcome_does_not_hide_newer_unknown_attempt() {
+    let operation_id = operation("notify/contract-123/v1");
+    let first_attempt = attempt("attempt-1");
+    let second_attempt = attempt("attempt-2");
+    let mut journal = prepared_journal(&operation_id, EffectSemantics::Idempotent);
+
+    dispatch(&mut journal, &operation_id, &first_attempt);
+    dispatch(&mut journal, &operation_id, &second_attempt);
+    outcome(
+        &mut journal,
+        &operation_id,
+        &first_attempt,
+        KnownEffectOutcome::Failed,
+    );
+
+    assert_eq!(
+        journal.state(&operation_id),
+        RecoveredEffectState::OutcomeUnknown
+    );
+    assert_eq!(
+        classify_recovery(&workflow_with_task(), &journal, &operation_id)
+            .expect("operation is known")
+            .action,
+        RecoveryAction::RetrySameOperation
+    );
+}
+
+#[test]
 fn task_operation_conflict_does_not_corrupt_existing_recovery() {
     let first_operation = operation("send-contract/contract-123/v1");
     let second_operation = operation("send-contract/contract-123/v2");

@@ -329,14 +329,14 @@ impl DurableJournal {
             .and_then(|attempt_id| self.dispatches.get(attempt_id))
     }
 
-    /// Returns the known outcome for an operation, if one has been checkpointed.
+    /// Returns the known outcome for the most recent dispatch, if it has been
+    /// checkpointed.
     #[must_use]
     pub fn known_outcome(&self, operation_id: &OperationId) -> Option<&OutcomeRecord> {
         self.operation_attempts
             .get(operation_id)
-            .into_iter()
-            .flatten()
-            .find_map(|attempt_id| self.outcomes.get(attempt_id))
+            .and_then(|attempts| attempts.last())
+            .and_then(|attempt_id| self.outcomes.get(attempt_id))
     }
 
     /// Derives local recovery knowledge from durable facts only.

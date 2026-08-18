@@ -271,8 +271,11 @@ pub enum RuntimeError {
     OutcomeAlreadyKnown(OperationId),
     /// A coalescing progress stream is full for a new semantic key.
     ProgressBackpressure,
-    /// The lossless lifecycle stream is full.
-    ExecutionBackpressure,
+    /// The lossless lifecycle stream is full and retains the rejected item.
+    ExecutionBackpressure {
+        /// Lifecycle item that can be retried after draining the stream.
+        item: StreamItem<RuntimeEvent>,
+    },
 }
 
 impl From<WorkflowGraphError> for RuntimeError {
@@ -332,7 +335,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "effect {operation_id} already has a known outcome")
             }
             Self::ProgressBackpressure => f.write_str("progress stream is backpressured"),
-            Self::ExecutionBackpressure => f.write_str("execution stream is backpressured"),
+            Self::ExecutionBackpressure { .. } => f.write_str("execution stream is backpressured"),
         }
     }
 }
@@ -634,6 +637,14 @@ impl Runtime {
         drain_lossless(&mut self.execution_events)
     }
 
+    /// Retries a lifecycle item returned by [`RuntimeError::ExecutionBackpressure`].
+    pub fn retry_execution_event(
+        &mut self,
+        item: StreamItem<RuntimeEvent>,
+    ) -> Result<(), RuntimeError> {
+        self.enqueue_execution(item)
+    }
+
     /// Drains retained progress observations.
     pub fn drain_progress_events(&mut self) -> Vec<KeyedStreamItem<Id, RuntimeEvent>> {
         drain_coalescing(&mut self.progress_events)
@@ -792,9 +803,7 @@ impl Runtime {
             task_id,
             attempt_id,
         })?;
-        self.execution_events
-            .try_push(item)
-            .map_err(|_| RuntimeError::ExecutionBackpressure)
+        self.enqueue_execution(item)
     }
 
     fn emit_completed(&mut self, task_id: Id, attempt_id: AttemptId) -> Result<(), RuntimeError> {
@@ -803,9 +812,13 @@ impl Runtime {
             task_id,
             attempt_id,
         })?;
+        self.enqueue_execution(item)
+    }
+
+    fn enqueue_execution(&mut self, item: StreamItem<RuntimeEvent>) -> Result<(), RuntimeError> {
         self.execution_events
             .try_push(item)
-            .map_err(|_| RuntimeError::ExecutionBackpressure)
+            .map_err(|PushError::Backpressure(item)| RuntimeError::ExecutionBackpressure { item })
     }
 }
 

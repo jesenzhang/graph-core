@@ -97,7 +97,7 @@ impl fmt::Display for SequenceError {
 impl std::error::Error for SequenceError {}
 
 /// Synchronous producer-side sequence allocator for one stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct StreamSequencer {
     stream_id: Id,
     next_sequence: Sequence,
