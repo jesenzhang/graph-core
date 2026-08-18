@@ -17,8 +17,50 @@ This matrix freezes the reference used for the semantic port. “PORT” means
 the behavioral invariant is implemented in Rust with an explicit Rust API;
 it does not mean the TypeScript API shape is copied.
 
+## 2026-08-18 paper reconciliation
+
+The original M2-A port was source-driven. The later Cordis paper,
+*A Programming Paradigm for Spatiotemporal Composability*, was cross-checked
+against the same upstream Cordis commit on 2026-08-18. The detailed record is
+[`CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md`](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md)
+([中文](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.zh.md)).
+
+The paper does **not** invalidate the M2-A acceptance result, but it narrows
+what M2-A proves:
+
+1. `DependencyEpoch` plus exact `Generation`/`EntryId` is a strong Rust
+   counterpart to Cordis's provider-identity target and committed dependency
+   view.
+2. M2-A exposes `CapabilityFiber::notify_dependency_change()`, but the
+   inspected `Scope::provide/replace/remove` paths do not themselves implement
+   Cordis's full automatic context-change notification chain. Full reactive
+   coeffect propagation therefore remains a separate semantic target.
+3. `Scope::teardown()` gives deterministic dependency-aware release and exact
+   snapshot lifetime, but Cordis provider withdrawal additionally hides the
+   provider from future resolution, drives committed consumers through their
+   own teardown, keeps the old binding readable during that teardown, and
+   waits for dependent quiescence before provider recovery. That protocol is
+   not implied by reverse-topological drop alone.
+4. Cordis's inverse model is process-local. The paper's system-boundary
+   discussion explicitly separates recoverable acquisitions from external
+   emissions. M1/M2 durable operation intent, dispatch, outcome, idempotency,
+   and reconciliation remain separate and higher-priority authorities.
+5. The paper's global temporal-composability results depend on witnessed
+   inverses, observational equivalence, and independence assumptions that
+   graph-core does not currently model. No full Cordis metatheory is claimed
+   for M2-A.
+
+One source-level correction is also frozen here: a single Cordis `ctx.effect`
+composes yielded/nested disposers in strict LIFO order, but current
+`Fiber._unload()` obtains top-level disposables in reverse order and starts
+those sibling cleanups with `Promise.all(...)`. graph-core's `EffectStack`
+intentionally uses stricter sequential reverse-order cleanup. That is a
+conservative Rust adaptation, not an incompatibility.
+
 ## Frozen references
 
+- Cordis paper: [`cordiverse/paper`](https://github.com/cordiverse/paper)
+  at `948a07b369c62adb3b12e102458be5c18dfb69b9` (draft dated 2026-08-13).
 - Cordis upstream: [`cordiverse/cordis`](https://github.com/cordiverse/cordis)
   at `8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4` (`main`), package
   `packages/core` version `4.0.0-rc.8`.
@@ -56,14 +98,18 @@ compatibility rule.
 | Fiber | `CapabilityFiber` | PORT | implemented |
 | `FiberState` | `FiberState` | PORT | implemented |
 | `inject` | explicit `Requirement` list | PORT | implemented |
-| dependency epoch | `DependencyEpoch` | PORT | implemented |
+| provider-identity target | `DependencyEpoch` over `Generation`/`EntryId` | PORT | implemented |
+| committed dependency view | `ResolvedDependencies` + retained handles | PORT | implemented for identity/lifetime |
+| automatic context-change notification | explicit `notify_dependency_change()` | STUDY | partial; automatic propagation not proven |
+| provider-withdrawal dependent drain | scope order + exact snapshot lifetime | STUDY | partial; live withdrawal protocol not proven |
 | `effect` | `ScopedEffect` | PORT | implemented |
-| `DisposableList` | `EffectStack` | PORT | implemented |
+| `DisposableList` | `EffectStack` | PORT | implemented with stricter sequential LIFO |
 | `restart` | `CapabilityFiber::restart` | PORT | implemented |
 | `update` | `CapabilityFiber::update` | PORT | implemented |
 | Service | typed capability factory/evaluate boundary | ADAPT | evaluated, no dynamic service base |
 | Reflect | explicit context lookup and registration | ADAPT | proxy rejected |
 | Events | lifecycle observer hooks | ADAPT | dynamic dispatch modes deferred |
+| effect independence / observational equivalence | no direct kernel counterpart | STUDY | not modeled; no global-theorem claim |
 | `group` | extension package | LATER/STUDY | deferred |
 | `include` | extension package | LATER/STUDY | deferred |
 | `loader` | plugin loading/config layer | LATER | deferred |
@@ -107,19 +153,28 @@ Compatibility tests: duplicate registration, one runtime with multiple
 fibers, invalid registration, exact removal, and cleanup of every associated
 fiber.
 
-### Fiber, requirements, and dependency epoch
+### Fiber, requirements, provider identity, and dependency epoch
 
 Reference: `fiber.ts` `FiberState`, `_refresh()`, `_setEpoch()`, `_reload()`,
 `_unload()`, `await()`, `restart()`, and `update()`. A fiber is pending until
 all declared injections resolve, loads once, unloads when a required
-implementation disappears or changes, and serializes unload/reload. An epoch
-change invalidates stale initialization; a final dispose cannot reload.
+implementation disappears or changes, and serializes unload/reload. Cordis
+computes the target from provider fiber identity rather than service value;
+a replacement provider is therefore different even when it exports an equal
+value.
 
 Rust mapping: `CapabilityFiber` is an explicit state machine. A
-`DependencyEpoch` snapshots the exact `Generation`/`EntryId` requirements.
-Each load attempt carries an epoch token; completion publishes only when the
-token is still current. A transition queue coalesces changes but never creates
-a replacement fiber merely to escape a race.
+`DependencyEpoch` snapshots exact `Generation`/`EntryId` requirements and a
+`PluginLoadContext` retains the exact `ResolvedDependencies`. Each load
+attempt carries an epoch token; completion publishes only when the token and
+exact dependencies are still current. This is the Rust counterpart to the
+paper's target/committed-view identity rule.
+
+Important limit: dependency-change signaling is currently explicit through
+`notify_dependency_change()`. M2-A proves stale-publication rejection and
+same-fiber convergence when driven, but it does not by itself prove that every
+`Scope` mutation automatically discovers and drives all affected dependent
+fibers.
 
 Compatibility tests: every Stage 3 transition, dependency replacement while
 loading/unloading, restart, update, failed initialization, stable-state await,
@@ -127,19 +182,63 @@ and final disposal.
 
 ### Effects and disposal
 
-Reference: `fiber.ts` `effect()` and `utils.ts` `DisposableList`. Effects are
-owned by the fiber/context scope, may register nested effects and asynchronous
-disposers, and unwind in reverse registration order. Cleanup failures are
-observed independently so one failure does not suppress the rest.
+Reference: `fiber.ts` `effect()` and `utils.ts` `DisposableList`, cross-checked
+against paper Section 5.1.1. Effects are owned by the fiber/context scope and
+may register nested effects and asynchronous disposers. A single composite
+`ctx.effect()` unwinds yielded/nested effects in reverse order and can recover
+partial setup.
 
-Rust mapping: `EffectStack` owns `ScopedEffect` values. Synchronous tests use
-owned disposer closures; async lifecycle uses explicit `Future` settlement
-through the runtime's lifecycle executor. `Drop` only releases Rust-owned
-memory; explicit disposal remains the authority for external resources.
+At the outer Fiber level, current Cordis reverses the top-level disposable
+list before launching cleanup through `Promise.all(...)`; sibling disposer
+completion is therefore not a globally sequential LIFO guarantee. The paper's
+global reordering results are conditional on effect independence.
+
+Rust mapping: `EffectStack` owns `ScopedEffect` values and intentionally awaits
+each disposer sequentially in reverse registration order. Cleanup continues
+after errors. `Drop` only releases Rust-owned memory; explicit disposal remains
+the authority for process-local external resources.
+
+Neither Cordis nor graph-core proves that a developer-supplied disposer is a
+correct semantic inverse. That remains a component contract and must be
+validated with effect-specific tests.
 
 Compatibility tests: reverse order, nested ownership, partial setup failure,
 async setup/cleanup, repeated disposal, cleanup error isolation, and stale
 epoch publication.
+
+### Provider withdrawal and committed dependencies
+
+Paper Section 4.3.1 and Cordis `ReflectService.provide()` add a stronger rule
+than dependency-aware destruction: when a provider leaves, it first stops
+participating in future resolution, then notifies and drains consumers that
+committed to it, while those consumers retain access to their committed
+binding during teardown. Provider recovery runs only after those dependents
+have quiesced.
+
+graph-core currently has two related but distinct mechanisms:
+
+- `Scope::teardown()` stops new lookup/mutation and releases local ownership in
+  deterministic dependency order;
+- each published entry retains exact dependency handles, so old provider
+  instances remain alive while dependents/readers hold snapshots.
+
+Those mechanisms provide strong identity/lifetime safety but do not alone
+prove Cordis's live withdrawal protocol. Automatic reactive notification and
+dependent quiescence are retained as follow-up semantics rather than silently
+claimed as part of M2-A.
+
+### System boundary and durability
+
+The Cordis paper distinguishes recoverable acquisitions from emissions that
+cross the system boundary. A resource handle/register/unregister lifetime can
+fit a revertible effect; an externally observed send, payment, or other
+non-idempotent mutation cannot be made as-if-never-happened by a disposer.
+Withholding/output commit or application-level compensation is required.
+
+This reinforces graph-core's existing authority split: `ScopedEffect` owns
+process-local cleanup; `DurableJournal` owns operation intent, dispatch,
+outcome and reconciliation truth. Capability teardown must never reinterpret
+a dispatched external operation.
 
 ## Stage 1 decisions
 
@@ -164,3 +263,10 @@ epoch publication.
    lifecycle semantics are useful, and rejected or deferred where they only
    provide dynamic-language convenience. See the decision note for the
    detailed PORT/ADAPT/DEFER/REJECT record.
+7. M1 task-attempt capability pinning remains authoritative: reactive provider
+   replacement may converge component/fiber state for future work, but it must
+   not rewrite exact capability handles already retained by an in-flight task
+   attempt.
+8. Loader/HMR remains above the kernel. Cordis's classify/detect/reload and
+   rollback pattern is retained only as a future multi-capability replacement
+   reference, not as durability evidence.
