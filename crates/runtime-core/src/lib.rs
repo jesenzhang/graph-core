@@ -1,7 +1,8 @@
 //! A synchronous, deterministic coordinator for the graph-core structures.
 //!
 //! [`WorkflowGraph`] remains the authority for topology and completion,
-//! [`DurableJournal`] remains the authority for external effects, and
+//! [`workflow_recovery::DurableStore`] remains the persistence authority for
+//! external-effect facts, while [`DurableJournal`] is the compatibility view,
 //! [`capability_graph::Scope`] remains the authority for capability lifetime
 //! and replacement. This crate owns coordination and disposable observations
 //! only.
@@ -18,37 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use workflow_graph::{MutationBatch, WorkflowGraph, WorkflowGraphError, WorkflowMutationRecord};
 use workflow_recovery::{
-    AttemptId, DispatchRecord, DurableJournal, EffectIntent, EffectSemantics, KnownEffectOutcome,
-    OperationId, OutcomeRecord, RecoveredEffectState, RecoveryAction, RecoveryDecision,
+    AttemptAdmission, AttemptId, CapabilityReplayIdentity, CommitRequest, DispatchRecord,
+    DurableJournal, DurableMutation, DurableRunState, DurableStore, EffectIntent, EffectSemantics,
+    IdempotencyKey, InMemoryDurableStore, KnownEffectOutcome, OperationId, OutcomeRecord,
+    RecoveredEffectState, RecoveryAction, RecoveryDecision, StoreError, StoreRevision,
     classify_recovery,
 };
 
-/// Identity of one workflow execution.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RunId(Id);
-
-impl RunId {
-    /// Creates a non-empty run identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`graph_core::InvalidId`] for an empty or whitespace-only value.
-    pub fn new(value: impl Into<String>) -> Result<Self, graph_core::InvalidId> {
-        Id::new(value).map(Self)
-    }
-
-    /// Returns the identity as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl fmt::Display for RunId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
+pub use workflow_recovery::RunId;
 
 /// A capability handle pinned for the complete lifetime of one task attempt.
 #[derive(Clone, Debug)]
@@ -59,6 +37,8 @@ pub struct CapabilityPin {
     pub generation: Generation,
     /// Exact published entry observed when the pin was created.
     pub entry_id: EntryId,
+    /// Stable logical identity used for durable replay validation.
+    pub replay_identity: CapabilityReplayIdentity,
     handle: CapabilityHandle,
 }
 
@@ -107,7 +87,7 @@ pub struct EffectSpec {
 /// Runtime inputs for a task; workflow topology and completion remain in the graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TaskConfig {
-    required_capabilities: BTreeSet<Id>,
+    required_capabilities: BTreeMap<Id, Option<String>>,
     effect: Option<EffectSpec>,
 }
 
@@ -116,7 +96,7 @@ impl TaskConfig {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            required_capabilities: BTreeSet::new(),
+            required_capabilities: BTreeMap::new(),
             effect: None,
         }
     }
@@ -124,7 +104,22 @@ impl TaskConfig {
     /// Adds one capability requirement in deterministic order.
     #[must_use]
     pub fn require_capability(mut self, capability_id: Id) -> Self {
-        self.required_capabilities.insert(capability_id);
+        self.required_capabilities
+            .entry(capability_id)
+            .or_insert(None);
+        self
+    }
+
+    /// Adds a capability requirement with a stable provider/configuration
+    /// identity for restart validation.
+    #[must_use]
+    pub fn require_capability_with_identity(
+        mut self,
+        capability_id: Id,
+        definition_identity: impl Into<String>,
+    ) -> Self {
+        self.required_capabilities
+            .insert(capability_id, Some(definition_identity.into()));
         self
     }
 
@@ -140,7 +135,7 @@ impl TaskConfig {
 
     /// Returns required capabilities in deterministic order.
     pub fn required_capabilities(&self) -> impl Iterator<Item = &Id> {
-        self.required_capabilities.iter()
+        self.required_capabilities.keys()
     }
 
     /// Returns the configured effect, if any.
@@ -245,6 +240,8 @@ pub enum RuntimeError {
     Capability(ScopeError),
     /// A durable effect fact was invalid.
     Journal(workflow_recovery::JournalError),
+    /// A durable store rejected a compare-and-swap or invariant check.
+    Store(StoreError),
     /// A runtime observation stream exhausted its sequence.
     Stream(SequenceError),
     /// A requested task does not exist in the workflow authority.
@@ -254,6 +251,14 @@ pub enum RuntimeError {
         /// Task that could not start.
         task_id: Id,
         /// Capability that was not visible.
+        capability_id: Id,
+    },
+    /// Restart supplied a capability configuration different from the one
+    /// durably admitted for an attempt.
+    CapabilityReplayMismatch {
+        /// Task whose admitted capability cannot be reconstructed.
+        task_id: Id,
+        /// Capability whose logical configuration differs.
         capability_id: Id,
     },
     /// The deterministic attempt identity allocator is exhausted.
@@ -298,6 +303,12 @@ impl From<workflow_recovery::JournalError> for RuntimeError {
     }
 }
 
+impl From<StoreError> for RuntimeError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
 impl From<SequenceError> for RuntimeError {
     fn from(error: SequenceError) -> Self {
         Self::Stream(error)
@@ -310,6 +321,7 @@ impl fmt::Display for RuntimeError {
             Self::Workflow(error) => write!(f, "workflow error: {error}"),
             Self::Capability(error) => write!(f, "capability error: {error}"),
             Self::Journal(error) => write!(f, "journal error: {error}"),
+            Self::Store(error) => write!(f, "durable store error: {error}"),
             Self::Stream(error) => write!(f, "stream error: {error}"),
             Self::UnknownTask(task_id) => write!(f, "unknown task: {task_id}"),
             Self::MissingCapability {
@@ -318,6 +330,13 @@ impl fmt::Display for RuntimeError {
             } => write!(
                 f,
                 "task {task_id} requires unavailable capability {capability_id}"
+            ),
+            Self::CapabilityReplayMismatch {
+                task_id,
+                capability_id,
+            } => write!(
+                f,
+                "task {task_id} capability {capability_id} does not match its durable replay identity"
             ),
             Self::AttemptIdExhausted => f.write_str("task attempt identity exhausted"),
             Self::CancelledBeforeDispatch(task_id) => {
@@ -352,6 +371,8 @@ pub struct Runtime {
     capability_context: CapabilityContext,
     capability_registry: CapabilityRegistry,
     journal: DurableJournal,
+    store: InMemoryDurableStore,
+    store_revision: StoreRevision,
     task_configs: BTreeMap<Id, TaskConfig>,
     attempts: Vec<TaskAttempt>,
     pending_started: Option<(TaskAttempt, StreamItem<RuntimeEvent>)>,
@@ -379,6 +400,75 @@ impl Runtime {
     where
         I: IntoIterator<Item = (Id, TaskConfig)>,
     {
+        let mut store = InMemoryDurableStore::new();
+        let store_revision = store.create_run(run_id.clone())?;
+        Self::build(
+            run_id,
+            workflow,
+            scope,
+            task_configs,
+            DurableJournal::new(),
+            store,
+            store_revision,
+        )
+    }
+
+    /// Restores a fresh process-local runtime from durable facts and supplied
+    /// workflow/capability configuration.
+    ///
+    /// The store view is detached before runtime objects are created.  No
+    /// stream, fiber, capability handle, or pending lifecycle observation is
+    /// reused from the previous process.
+    pub fn restore_run<I>(
+        run_id: RunId,
+        workflow: WorkflowGraph,
+        scope: Scope,
+        task_configs: I,
+        store: InMemoryDurableStore,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IntoIterator<Item = (Id, TaskConfig)>,
+    {
+        let state = store.load_run(&run_id)?;
+        let mut runtime = Self::build(
+            run_id,
+            workflow,
+            scope,
+            task_configs,
+            DurableJournal::from_durable_state(&state)?,
+            store,
+            state.revision(),
+        )?;
+        for cancellation in state.cancellations() {
+            runtime.cancelled.insert(cancellation.task_id.clone());
+        }
+        for admission in state.attempts() {
+            let capability_pins = runtime
+                .capture_capability_pins(&admission.task_id, Some(&admission.capabilities))?;
+            runtime.attempts.push(TaskAttempt {
+                run_id: admission.run_id.clone(),
+                task_id: admission.task_id.clone(),
+                attempt_id: admission.attempt_id.clone(),
+                operation_id: admission.operation_id.clone(),
+                capability_pins,
+            });
+        }
+        runtime.next_attempt_number = state.attempts().count() as u64 + 1;
+        Ok(runtime)
+    }
+
+    fn build<I>(
+        run_id: RunId,
+        workflow: WorkflowGraph,
+        scope: Scope,
+        task_configs: I,
+        journal: DurableJournal,
+        store: InMemoryDurableStore,
+        store_revision: StoreRevision,
+    ) -> Result<Self, RuntimeError>
+    where
+        I: IntoIterator<Item = (Id, TaskConfig)>,
+    {
         let mut configs = BTreeMap::new();
         for (task_id, config) in task_configs {
             if workflow.task(&task_id).is_none() {
@@ -386,15 +476,15 @@ impl Runtime {
             }
             configs.insert(task_id, config);
         }
-
-        let capability_context = CapabilityContext::from_scope(scope.clone());
         Ok(Self {
             run_id,
             workflow,
-            scope,
-            capability_context,
+            scope: scope.clone(),
+            capability_context: CapabilityContext::from_scope(scope),
             capability_registry: CapabilityRegistry::new(),
-            journal: DurableJournal::new(),
+            journal,
+            store,
+            store_revision,
             task_configs: configs,
             attempts: Vec::new(),
             pending_started: None,
@@ -422,10 +512,25 @@ impl Runtime {
         &self.workflow
     }
 
-    /// Returns the authoritative durable effect journal.
+    /// Returns the materialized durable effect journal compatibility view.
+    ///
+    /// Durable mutations are committed to [`Self::store`] before this view is
+    /// replaced.  Recovery policy still consumes this view, never stream or
+    /// fiber state.
     #[must_use]
     pub const fn journal(&self) -> &DurableJournal {
         &self.journal
+    }
+
+    /// Returns the process-independent in-memory store adapter.
+    #[must_use]
+    pub const fn store(&self) -> &InMemoryDurableStore {
+        &self.store
+    }
+
+    /// Returns the current detached durable run view.
+    pub fn durable_state(&self) -> Result<DurableRunState, RuntimeError> {
+        Ok(self.store.load_run(&self.run_id)?)
     }
 
     /// Returns the capability scope used for future resolutions.
@@ -492,11 +597,18 @@ impl Runtime {
                 WorkflowGraphError::TaskAlreadyCompleted(task_id),
             ));
         }
-        self.journal.persist_intent(EffectIntent {
+        let intent = EffectIntent {
             task_id,
             operation_id,
             semantics,
-        })?;
+        };
+        let mut candidate = self.journal.clone();
+        candidate.persist_intent(intent.clone())?;
+        self.commit_durable(
+            format!("intent:{}", intent.operation_id),
+            vec![DurableMutation::RecordIntent(intent)],
+        )?;
+        self.journal = candidate;
         Ok(())
     }
 
@@ -536,10 +648,17 @@ impl Runtime {
             RecoveredEffectState::NotPrepared => unreachable!("intent lookup proved prepared"),
         };
 
-        self.journal.persist_dispatch(DispatchRecord {
+        let dispatch = DispatchRecord {
             operation_id: operation_id.clone(),
             attempt_id: attempt_id.clone(),
-        })?;
+        };
+        let mut candidate = self.journal.clone();
+        candidate.persist_dispatch(dispatch.clone())?;
+        self.commit_durable(
+            format!("dispatch:{}", attempt_id),
+            vec![DurableMutation::RecordDispatch(dispatch)],
+        )?;
+        self.journal = candidate;
         Ok(attempt_id)
     }
 
@@ -554,11 +673,18 @@ impl Runtime {
         attempt_id: AttemptId,
         outcome: KnownEffectOutcome,
     ) -> Result<(), RuntimeError> {
-        self.journal.persist_outcome(OutcomeRecord {
+        let outcome = OutcomeRecord {
             operation_id: operation_id.clone(),
             attempt_id: attempt_id.clone(),
             outcome,
-        })?;
+        };
+        let mut candidate = self.journal.clone();
+        candidate.persist_outcome(outcome.clone())?;
+        self.commit_durable(
+            format!("outcome:{}", attempt_id),
+            vec![DurableMutation::RecordOutcome(outcome)],
+        )?;
+        self.journal = candidate;
         Ok(())
     }
 
@@ -593,15 +719,31 @@ impl Runtime {
         if self.workflow.task(task_id).is_none() {
             return Err(RuntimeError::UnknownTask(task_id.clone()));
         }
-        self.cancelled.insert(task_id.clone());
-        if let Some(operation_id) = self.journal.operation_for_task(task_id) {
-            if let Some(dispatch) = self.journal.latest_dispatch(operation_id) {
-                return Ok(Cancellation::AlreadyDispatched {
+        let operation_id = self.journal.operation_for_task(task_id).cloned();
+        let attempt_id = operation_id
+            .as_ref()
+            .and_then(|operation_id| self.attempt_for_task(task_id, Some(operation_id)));
+        let already_dispatched = operation_id
+            .as_ref()
+            .and_then(|operation_id| self.journal.latest_dispatch(operation_id).cloned());
+        self.commit_durable(
+            format!("cancel:{}", task_id),
+            vec![DurableMutation::RecordCancellation(
+                workflow_recovery::CancellationRecord {
+                    run_id: self.run_id.clone(),
                     task_id: task_id.clone(),
                     operation_id: operation_id.clone(),
-                    attempt_id: dispatch.attempt_id.clone(),
-                });
-            }
+                    attempt_id,
+                },
+            )],
+        )?;
+        self.cancelled.insert(task_id.clone());
+        if let (Some(operation_id), Some(dispatch)) = (operation_id, already_dispatched) {
+            return Ok(Cancellation::AlreadyDispatched {
+                task_id: task_id.clone(),
+                operation_id,
+                attempt_id: dispatch.attempt_id,
+            });
         }
         Ok(Cancellation::NotDispatched {
             task_id: task_id.clone(),
@@ -782,38 +924,9 @@ impl Runtime {
         task_id: &Id,
         operation_id: Option<OperationId>,
     ) -> Result<AttemptId, RuntimeError> {
-        let required_capabilities = self
-            .task_configs
-            .get(task_id)
-            .map(|config| {
-                config
-                    .required_capabilities
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut capability_pins = Vec::with_capacity(required_capabilities.len());
-        for capability_id in required_capabilities {
-            let handle = self.capability_context.get(&capability_id).ok_or_else(|| {
-                RuntimeError::MissingCapability {
-                    task_id: task_id.clone(),
-                    capability_id: capability_id.clone(),
-                }
-            })?;
-            capability_pins.push(CapabilityPin {
-                capability_id,
-                generation: handle.generation(),
-                entry_id: handle.entry_id(),
-                handle,
-            });
-        }
+        let capability_pins = self.capture_capability_pins(task_id, None)?;
 
         let attempt_number = self.next_attempt_number;
-        self.next_attempt_number = self
-            .next_attempt_number
-            .checked_add(1)
-            .ok_or(RuntimeError::AttemptIdExhausted)?;
         let attempt_id = AttemptId::new(format!("{}-attempt-{attempt_number}", self.run_id))
             .expect("generated attempt identity is non-empty");
         let attempt = TaskAttempt {
@@ -823,6 +936,24 @@ impl Runtime {
             operation_id,
             capability_pins,
         };
+        self.commit_durable(
+            format!("admit:{}", attempt.attempt_id),
+            vec![DurableMutation::AdmitAttempt(AttemptAdmission {
+                run_id: attempt.run_id.clone(),
+                task_id: attempt.task_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                operation_id: attempt.operation_id.clone(),
+                capabilities: attempt
+                    .capability_pins
+                    .iter()
+                    .map(|pin| pin.replay_identity.clone())
+                    .collect(),
+            })],
+        )?;
+        self.next_attempt_number = self
+            .next_attempt_number
+            .checked_add(1)
+            .ok_or(RuntimeError::AttemptIdExhausted)?;
         let item = self.execution_sequencer.emit(RuntimeEvent::TaskStarted {
             run_id: self.run_id.clone(),
             task_id: task_id.clone(),
@@ -839,6 +970,74 @@ impl Runtime {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn capture_capability_pins(
+        &self,
+        task_id: &Id,
+        expected: Option<&[CapabilityReplayIdentity]>,
+    ) -> Result<Vec<CapabilityPin>, RuntimeError> {
+        let required_capabilities = self
+            .task_configs
+            .get(task_id)
+            .map(|config| {
+                config
+                    .required_capabilities
+                    .iter()
+                    .map(|(capability_id, identity)| (capability_id.clone(), identity.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut capability_pins = Vec::with_capacity(required_capabilities.len());
+        for (capability_id, configured_identity) in required_capabilities {
+            let handle = self.capability_context.get(&capability_id).ok_or_else(|| {
+                RuntimeError::MissingCapability {
+                    task_id: task_id.clone(),
+                    capability_id: capability_id.clone(),
+                }
+            })?;
+            if let Some(configured_identity) = configured_identity.as_deref() {
+                if configured_identity != handle.replay_identity() {
+                    return Err(RuntimeError::CapabilityReplayMismatch {
+                        task_id: task_id.clone(),
+                        capability_id: capability_id.clone(),
+                    });
+                }
+            }
+            let replay_identity =
+                CapabilityReplayIdentity::new(capability_id.clone(), handle.replay_identity());
+            capability_pins.push(CapabilityPin {
+                capability_id,
+                generation: handle.generation(),
+                entry_id: handle.entry_id(),
+                replay_identity,
+                handle,
+            });
+        }
+        if let Some(expected) = expected {
+            let expected = expected
+                .iter()
+                .map(|identity| (identity.capability_id().clone(), identity))
+                .collect::<BTreeMap<_, _>>();
+            if expected.len() != capability_pins.len()
+                || capability_pins.iter().any(|pin| {
+                    expected
+                        .get(&pin.capability_id)
+                        .is_none_or(|identity| *identity != &pin.replay_identity)
+                })
+            {
+                let capability_id = capability_pins
+                    .first()
+                    .map(|pin| pin.capability_id.clone())
+                    .or_else(|| expected.keys().next().cloned())
+                    .unwrap_or_else(|| Id::new("durable-capability-mismatch").expect("static id"));
+                return Err(RuntimeError::CapabilityReplayMismatch {
+                    task_id: task_id.clone(),
+                    capability_id,
+                });
+            }
+        }
+        Ok(capability_pins)
     }
 
     fn pending_attempt(&self, task_id: &Id, operation_id: &OperationId) -> Option<AttemptId> {
@@ -880,6 +1079,21 @@ impl Runtime {
         self.execution_events
             .try_push(item)
             .map_err(|PushError::Backpressure(item)| RuntimeError::ExecutionBackpressure { item })
+    }
+
+    fn commit_durable(
+        &mut self,
+        idempotency_key: String,
+        mutations: Vec<DurableMutation>,
+    ) -> Result<StoreRevision, RuntimeError> {
+        let result = self.store.commit(CommitRequest {
+            run_id: self.run_id.clone(),
+            expected_revision: self.store_revision,
+            idempotency_key: IdempotencyKey::new(idempotency_key)?,
+            mutations,
+        })?;
+        self.store_revision = result.revision;
+        Ok(result.revision)
     }
 }
 

@@ -49,6 +49,9 @@ pub struct CapabilityDefinition {
     pub id: CapabilityId,
     /// Human-readable capability kind such as model or service.
     pub kind: String,
+    /// Stable provider/configuration identity used when reconstructing a
+    /// capability in a new process.
+    pub replay_identity: String,
     /// Required capabilities. A sorted set makes equivalent definitions stable.
     pub dependencies: BTreeSet<Dependency>,
 }
@@ -57,11 +60,20 @@ impl CapabilityDefinition {
     /// Creates a capability definition with no dependencies.
     #[must_use]
     pub fn new(id: CapabilityId, kind: impl Into<String>) -> Self {
+        let kind = kind.into();
         Self {
-            id,
-            kind: kind.into(),
+            id: id.clone(),
+            replay_identity: format!("{}:{kind}", id),
+            kind,
             dependencies: BTreeSet::new(),
         }
+    }
+
+    /// Returns this definition with an explicit stable replay identity.
+    #[must_use]
+    pub fn with_replay_identity(mut self, replay_identity: impl Into<String>) -> Self {
+        self.replay_identity = replay_identity.into();
+        self
     }
 
     /// Returns this definition with one additional dependency.

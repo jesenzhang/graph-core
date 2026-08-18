@@ -157,16 +157,26 @@ merged under one generic retry API.
     deterministic in-memory conformance backend, then crash-boundary tests,
     before selecting a concrete backend.
 
-## M2-B1 implementation plan (not executed)
+## M2-B1 implementation status
 
-- Define typed load/commit/query operations for run state, operation facts,
-  cancellation, dispatch, and outcomes.
-- Require expected revision, idempotency key, `OperationId`, and `AttemptId` on
-  every correctness mutation.
-- Add tests for all six crash/cancellation/retry boundaries and for stale
-  outcome rejection.
-- Keep capability pinning at `TaskAttempt` admission and keep Fiber/streams
-  outside the durable authority.
-- Stop after the interface and conformance backend; do not add provider,
-  distributed, or async scheduling concerns in the first slice.
+The first M2-B1 slice is implemented with a synchronous typed
+`DurableStore` seam and deterministic `InMemoryDurableStore` adapter.  Its
+`StoreRevision` is independent from workflow topology revision.  Attempt
+admission is an append-only fact before `TaskStarted`; dispatch and outcome
+facts retain exact `AttemptId` lineage, and recovery authority follows the
+latest dispatch while older outcomes remain history.  Cancellation is retained
+and conflicting cancellation lineage is rejected without rewriting prior
+facts.  Capability replay identity is stored separately from process-local
+generation, `EntryId`, and live handles.
 
+Runtime restart tests reconstruct a new runtime from a cloned durable store
+view with fresh streams and capability handles.  No physical persistence
+adapter is selected in this milestone.
+
+## M2-B1 follow-up boundaries
+
+- Select a physical persistence adapter only in a later milestone.
+- Keep provider reconciliation, worker leasing/fencing, timers, compaction,
+  and distributed execution outside this slice.
+- Preserve capability pinning at `TaskAttempt` admission and keep
+  Fiber/streams outside the durable authority.

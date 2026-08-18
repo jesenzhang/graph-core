@@ -165,6 +165,12 @@ impl CapabilityHandle {
         &self.definition.kind
     }
 
+    /// Returns the stable provider/configuration identity for replay.
+    #[must_use]
+    pub fn replay_identity(&self) -> &str {
+        &self.definition.replay_identity
+    }
+
     /// Returns the exact publication generation.
     #[must_use]
     pub fn generation(&self) -> Generation {

@@ -1,5 +1,6 @@
 //! In-memory durable fact model for the E04 experiment.
 
+use crate::DurableRunState;
 use crate::model::{
     AttemptId, DispatchRecord, EffectIntent, KnownEffectOutcome, OperationId, OutcomeRecord,
     RecoveredEffectState,
@@ -10,16 +11,8 @@ use std::fmt;
 /// Structured invariant that rejects an impossible durable fact sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JournalInvariant {
-    /// A second dispatch was attempted after a known outcome was recorded.
-    DispatchAfterKnownOutcome {
-        /// Operation that already has a known outcome.
-        operation_id: OperationId,
-    },
-    /// More than one attempt was given a known outcome for one operation.
-    MultipleKnownOutcomes {
-        /// Operation with contradictory attempt outcomes.
-        operation_id: OperationId,
-    },
+    /// A reserved extension point for future journal-only invariants.
+    Reserved,
 }
 
 /// Error returned when a durable journal mutation would create malformed facts.
@@ -90,15 +83,7 @@ pub enum JournalError {
 impl fmt::Display for JournalInvariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DispatchAfterKnownOutcome { operation_id } => {
-                write!(
-                    f,
-                    "dispatch after known outcome for operation {operation_id}"
-                )
-            }
-            Self::MultipleKnownOutcomes { operation_id } => {
-                write!(f, "multiple known outcomes for operation {operation_id}")
-            }
+            Self::Reserved => f.write_str("reserved journal invariant"),
         }
     }
 }
@@ -196,6 +181,23 @@ impl DurableJournal {
         }
     }
 
+    /// Reconstructs the compatibility journal view from detached durable
+    /// state.  The store remains the persistence authority; this value is a
+    /// process-local query view used by existing recovery callers.
+    pub fn from_durable_state(state: &DurableRunState) -> Result<Self, JournalError> {
+        let mut journal = Self::new();
+        for intent in state.intents() {
+            journal.persist_intent(intent.clone())?;
+        }
+        for dispatch in state.dispatch_history() {
+            journal.persist_dispatch(dispatch.clone())?;
+        }
+        for outcome in state.outcome_history_all() {
+            journal.persist_outcome(outcome.clone())?;
+        }
+        Ok(journal)
+    }
+
     /// Persists one effect intent before any dispatch is allowed.
     ///
     /// # Errors
@@ -236,14 +238,6 @@ impl DurableJournal {
                 attempt_id: dispatch.attempt_id,
             });
         }
-        if self.known_outcome(&dispatch.operation_id).is_some() {
-            return Err(JournalError::InvariantViolation(
-                JournalInvariant::DispatchAfterKnownOutcome {
-                    operation_id: dispatch.operation_id,
-                },
-            ));
-        }
-
         self.operation_attempts
             .entry(dispatch.operation_id.clone())
             .or_default()
@@ -288,14 +282,6 @@ impl DurableJournal {
                 attempted: outcome.outcome,
             });
         }
-        if self.known_outcome(&outcome.operation_id).is_some() {
-            return Err(JournalError::InvariantViolation(
-                JournalInvariant::MultipleKnownOutcomes {
-                    operation_id: outcome.operation_id,
-                },
-            ));
-        }
-
         self.outcomes.insert(outcome.attempt_id.clone(), outcome);
         Ok(())
     }

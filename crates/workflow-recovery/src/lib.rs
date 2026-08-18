@@ -4,10 +4,16 @@
 //! claim filesystem, database, power-loss, or distributed-transaction
 //! durability.
 
+mod durable;
 mod journal;
 mod model;
 mod recovery;
 
+pub use durable::{
+    AttemptAdmission, CancellationRecord, CapabilityReplayIdentity, CommitRequest, CommitResult,
+    DurableMutation, DurableRunState, DurableStore, IdempotencyKey, InMemoryDurableStore, RunId,
+    StoreError, StoreInvariant, StoreRevision,
+};
 pub use journal::{DurableJournal, JournalError, JournalInvariant};
 pub use model::{
     AttemptId, DispatchRecord, EffectIntent, EffectSemantics, KnownEffectOutcome, OperationId,
