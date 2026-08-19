@@ -1,8 +1,8 @@
-//! M2-C1 repair evidence across the reactive/runtime-core boundary.
+//! M2-C1 reactive lifecycle evidence through the Runtime-owned boundary.
 
 use capability_graph::{
-    CapabilityContext, CapabilityDefinition, CapabilityFiber, CapabilityValue, PluginDefinition,
-    PluginFactory, PluginLoadContext, PluginRuntime, ReactiveCapabilityRuntime, Scope,
+    CapabilityDefinition, CapabilityFiber, CapabilityValue, PluginDefinition, PluginFactory,
+    PluginLoadContext, PluginRuntime, Scope,
 };
 use graph_core::Id;
 use runtime_core::{RunId, Runtime, StepResult, TaskConfig};
@@ -63,21 +63,21 @@ fn config(provider: &Id) -> TaskConfig {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn shared_scope_proves_reactive_replacement_preserves_m1_attempt_pins() {
+async fn runtime_owned_reactive_replacement_preserves_m1_attempt_pins() {
     let provider_id = id("shared-provider");
     let scope = Scope::root();
     let mut runtime = Runtime::start_run(
         RunId::new("m2c1-cross-boundary").expect("run id is valid"),
         workflow(),
-        scope.clone(),
+        scope,
         [
             (id("attempt-a"), config(&provider_id)),
             (id("attempt-b"), config(&provider_id)),
         ],
     )
     .expect("runtime starts");
-    let reactive = ReactiveCapabilityRuntime::new(CapabilityContext::from_scope(scope.clone()));
-    let v1 = reactive
+    let v1 = runtime
+        .capability_runtime()
         .provide(
             CapabilityDefinition::new(provider_id.clone(), "provider")
                 .with_replay_identity("provider-v1"),
@@ -102,11 +102,12 @@ async fn shared_scope_proves_reactive_replacement_preserves_m1_attempt_pins() {
             }
         }),
     ));
-    reactive
-        .registry()
+    runtime
+        .capability_registry()
         .register(dependent_runtime)
         .expect("dependent registers");
-    let dependent: Arc<CapabilityFiber> = reactive
+    let dependent: Arc<CapabilityFiber> = runtime
+        .capability_runtime()
         .instantiate(&id("shared-dependent"), String::new())
         .expect("dependent instantiates");
     assert_eq!(
@@ -134,8 +135,24 @@ async fn shared_scope_proves_reactive_replacement_preserves_m1_attempt_pins() {
             .entry_id,
         v1.entry_id()
     );
+    assert_eq!(
+        runtime.attempts()[0]
+            .capability(&provider_id)
+            .expect("attempt A pin")
+            .generation,
+        v1.generation()
+    );
+    assert_eq!(
+        runtime.attempts()[0]
+            .capability(&provider_id)
+            .expect("attempt A pin")
+            .replay_identity
+            .definition_identity(),
+        "provider-v1"
+    );
 
-    let (v2, report) = reactive
+    let (v2, report) = runtime
+        .capability_runtime()
         .replace_and_reconcile(
             CapabilityDefinition::new(provider_id.clone(), "provider")
                 .with_replay_identity("provider-v2"),
@@ -180,5 +197,20 @@ async fn shared_scope_proves_reactive_replacement_preserves_m1_attempt_pins() {
             .expect("attempt B pin")
             .entry_id,
         v2.entry_id()
+    );
+    assert_eq!(
+        runtime.attempts()[1]
+            .capability(&provider_id)
+            .expect("attempt B pin")
+            .generation,
+        v2.generation()
+    );
+    assert_eq!(
+        runtime.attempts()[1]
+            .capability(&provider_id)
+            .expect("attempt B pin")
+            .replay_identity
+            .definition_identity(),
+        "provider-v2"
     );
 }

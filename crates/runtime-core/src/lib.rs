@@ -8,7 +8,8 @@
 //! only.
 
 use capability_graph::{
-    CapabilityContext, CapabilityHandle, CapabilityRegistry, EntryId, Generation, Scope, ScopeError,
+    CapabilityContext, CapabilityHandle, CapabilityRegistry, EntryId, Generation,
+    ReactiveCapabilityRuntime, Scope, ScopeError,
 };
 use execution_stream::{
     CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, SequenceError,
@@ -367,9 +368,7 @@ impl std::error::Error for RuntimeError {}
 pub struct Runtime {
     run_id: RunId,
     workflow: WorkflowGraph,
-    scope: Scope,
-    capability_context: CapabilityContext,
-    capability_registry: CapabilityRegistry,
+    capability_runtime: ReactiveCapabilityRuntime,
     journal: DurableJournal,
     store: InMemoryDurableStore,
     store_revision: StoreRevision,
@@ -479,9 +478,9 @@ impl Runtime {
         Ok(Self {
             run_id,
             workflow,
-            scope: scope.clone(),
-            capability_context: CapabilityContext::from_scope(scope),
-            capability_registry: CapabilityRegistry::new(),
+            capability_runtime: ReactiveCapabilityRuntime::new(CapabilityContext::from_scope(
+                scope,
+            )),
             journal,
             store,
             store_revision,
@@ -535,22 +534,28 @@ impl Runtime {
 
     /// Returns the capability scope used for future resolutions.
     #[must_use]
-    pub const fn scope(&self) -> &Scope {
-        &self.scope
+    pub fn scope(&self) -> &Scope {
+        self.capability_runtime.scope()
     }
 
     /// Returns the explicit Cordis-derived context view used for capability
     /// runtime coordination. It does not become an authority for workflow or
     /// durable effect facts.
     #[must_use]
-    pub const fn capability_context(&self) -> &CapabilityContext {
-        &self.capability_context
+    pub fn capability_context(&self) -> &CapabilityContext {
+        self.capability_runtime.context()
     }
 
     /// Returns the process-local plugin runtime registry.
     #[must_use]
-    pub const fn capability_registry(&self) -> &CapabilityRegistry {
-        &self.capability_registry
+    pub fn capability_registry(&self) -> &CapabilityRegistry {
+        self.capability_runtime.registry()
+    }
+
+    /// Returns the runtime-owned reactive capability coordinator.
+    #[must_use]
+    pub const fn capability_runtime(&self) -> &ReactiveCapabilityRuntime {
+        &self.capability_runtime
     }
 
     /// Returns all attempts in deterministic creation order.
@@ -990,12 +995,14 @@ impl Runtime {
             .unwrap_or_default();
         let mut capability_pins = Vec::with_capacity(required_capabilities.len());
         for (capability_id, configured_identity) in required_capabilities {
-            let handle = self.capability_context.get(&capability_id).ok_or_else(|| {
-                RuntimeError::MissingCapability {
+            let handle = self
+                .capability_runtime
+                .context()
+                .get(&capability_id)
+                .ok_or_else(|| RuntimeError::MissingCapability {
                     task_id: task_id.clone(),
                     capability_id: capability_id.clone(),
-                }
-            })?;
+                })?;
             if let Some(configured_identity) = configured_identity.as_deref() {
                 if configured_identity != handle.replay_identity() {
                     return Err(RuntimeError::CapabilityReplayMismatch {
