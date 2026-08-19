@@ -5,7 +5,7 @@ use capability_graph::{
     FiberState, PluginDefinition, PluginFactory, PluginLoadContext, PluginRuntime,
     ReactiveCapabilityRuntime, ScopedEffect,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

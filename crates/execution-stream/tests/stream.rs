@@ -4,7 +4,7 @@ use execution_stream::{
     CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, Sequence,
     SequenceObservation, SequenceTracker, StreamError, StreamItem,
 };
-use graph_core::Id;
+use kernis_core::Id;
 
 fn id(value: &str) -> Id {
     Id::new(value).expect("test id is valid")

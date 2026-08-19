@@ -27,7 +27,7 @@ pub enum JournalError {
     /// A task already owns a different logical external operation.
     TaskOperationConflict {
         /// Workflow task that already has an effect owner.
-        task_id: graph_core::Id,
+        task_id: kernis_core::Id,
         /// Operation currently owning the task.
         existing_operation: OperationId,
         /// Operation that attempted to claim the task.
@@ -74,7 +74,7 @@ pub enum JournalError {
         /// Operation associated with the mismatch.
         operation_id: OperationId,
         /// Task associated with the mismatch.
-        task_id: graph_core::Id,
+        task_id: kernis_core::Id,
         /// Effect state observed at the boundary.
         state: RecoveredEffectState,
     },
@@ -162,7 +162,7 @@ impl std::error::Error for JournalError {}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DurableJournal {
     intents: BTreeMap<OperationId, EffectIntent>,
-    task_operations: BTreeMap<graph_core::Id, OperationId>,
+    task_operations: BTreeMap<kernis_core::Id, OperationId>,
     dispatches: BTreeMap<AttemptId, DispatchRecord>,
     operation_attempts: BTreeMap<OperationId, Vec<AttemptId>>,
     outcomes: BTreeMap<AttemptId, OutcomeRecord>,
@@ -302,7 +302,7 @@ impl DurableJournal {
     /// The mapping is derived from the durable intent admission table. It is
     /// exposed so coordinators do not need to keep a second task/effect map.
     #[must_use]
-    pub fn operation_for_task(&self, task_id: &graph_core::Id) -> Option<&OperationId> {
+    pub fn operation_for_task(&self, task_id: &kernis_core::Id) -> Option<&OperationId> {
         self.task_operations.get(task_id)
     }
 

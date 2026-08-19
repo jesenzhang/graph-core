@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 capability-graph = { path = "../capability-graph" }
 execution-stream = { path = "../execution-stream" }
-graph-core = { path = "../core" }
+kernis-core = { path = "../core" }
 workflow-graph = { path = "../workflow-graph" }
 workflow-recovery = { path = "../workflow-recovery" }
 

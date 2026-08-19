@@ -5,7 +5,7 @@ use capability_graph::{
     CapabilityContext, CapabilityDefinition, CapabilityValue, PluginDefinition, PluginFactory,
     PluginLoadContext, PluginRuntime,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use runtime_core::{RunId, Runtime};
 use std::sync::Arc;
 use workflow_graph::WorkflowGraph;

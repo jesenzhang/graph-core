@@ -4,7 +4,7 @@ use capability_graph::{
     CapabilityDefinition, CapabilityFiber, CapabilityValue, FiberState, PluginDefinition,
     PluginFactory, PluginLoadContext, PluginRuntime, ReactiveRuntimeError, RegistryError, Scope,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use runtime_core::{RunId, Runtime, StepResult, TaskConfig};
 use std::future::Future;
 use std::sync::Arc;

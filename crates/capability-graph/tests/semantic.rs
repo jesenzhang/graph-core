@@ -5,7 +5,7 @@ use capability_graph::{
     CapabilityValue, EffectError, EffectScope, EffectStack, FiberError, FiberState,
     PluginDefinition, PluginFactory, PluginLoadContext, PluginRuntime, Scope, ScopedEffect,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

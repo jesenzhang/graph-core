@@ -1,6 +1,6 @@
 //! Typed facts and decisions for the crash/recovery boundary.
 
-use graph_core::{Id, InvalidId};
+use kernis_core::{Id, InvalidId};
 use std::fmt;
 
 /// Stable identity of one logical external side effect.

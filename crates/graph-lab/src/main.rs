@@ -5,7 +5,7 @@ use execution_stream::{
     CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, Sequence,
     SequenceObservation, SequenceTracker, StreamItem,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use runtime_core::{RunId, Runtime as CoreRuntime, StepResult, TaskConfig};
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{

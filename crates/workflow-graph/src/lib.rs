@@ -1,6 +1,6 @@
 //! Versioned workflow topology and immutable execution-fact experiments.
 
-use graph_core::{Id, Revision};
+use kernis_core::{Id, Revision};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 

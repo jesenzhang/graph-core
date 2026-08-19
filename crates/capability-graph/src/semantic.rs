@@ -8,7 +8,7 @@ use crate::{
     CapabilityDefinition, CapabilityHandle, CapabilityId, CapabilityValue, Generation,
     ResolvedDependencies, Scope, ScopeError,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;

@@ -1,7 +1,7 @@
 //! Cross-structure evidence that stream transport is not workflow truth.
 
 use execution_stream::{CoalescingBuffer, KeyedStreamItem, LossyBuffer, Sequence, StreamItem};
-use graph_core::Id;
+use kernis_core::Id;
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{
     DurableJournal, EffectIntent, EffectSemantics, OperationId, RecoveryAction, classify_recovery,

@@ -6,7 +6,7 @@ version = 4
 name = "capability-graph"
 version = "0.1.0"
 dependencies = [
- "graph-core",
+ "kernis-core",
  "tokio",
 ]
 
@@ -14,12 +14,8 @@ dependencies = [
 name = "execution-stream"
 version = "0.1.0"
 dependencies = [
- "graph-core",
+ "kernis-core",
 ]
-
-[[package]]
-name = "graph-core"
-version = "0.1.0"
 
 [[package]]
 name = "graph-lab"
@@ -27,11 +23,15 @@ version = "0.1.0"
 dependencies = [
  "capability-graph",
  "execution-stream",
- "graph-core",
+ "kernis-core",
  "runtime-core",
  "workflow-graph",
  "workflow-recovery",
 ]
+
+[[package]]
+name = "kernis-core"
+version = "0.1.0"
 
 [[package]]
 name = "pin-project-lite"
@@ -63,7 +63,7 @@ version = "0.1.0"
 dependencies = [
  "capability-graph",
  "execution-stream",
- "graph-core",
+ "kernis-core",
  "tokio",
  "workflow-graph",
  "workflow-recovery",
@@ -111,13 +111,13 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 name = "workflow-graph"
 version = "0.1.0"
 dependencies = [
- "graph-core",
+ "kernis-core",
 ]
 
 [[package]]
 name = "workflow-recovery"
 version = "0.1.0"
 dependencies = [
- "graph-core",
+ "kernis-core",
  "workflow-graph",
 ]

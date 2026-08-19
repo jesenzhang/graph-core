@@ -1,6 +1,6 @@
 //! Capability definitions and exact runtime identity types.
 
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::BTreeSet;
 use std::fmt;
 

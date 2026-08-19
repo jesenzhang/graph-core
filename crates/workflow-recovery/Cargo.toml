@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-graph-core = { path = "../core" }
+kernis-core = { path = "../core" }
 workflow-graph = { path = "../workflow-graph" }
 
 [lints]

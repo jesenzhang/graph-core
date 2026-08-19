@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use graph_core::Id;
+use kernis_core::Id;
 use workflow_recovery::{
     AttemptAdmission, AttemptId, CapabilityReplayIdentity, CommitRequest, DurableMutation,
     DurableStore, EffectIntent, EffectSemantics, IdempotencyKey, InMemoryDurableStore,

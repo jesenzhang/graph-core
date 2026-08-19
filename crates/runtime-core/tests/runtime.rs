@@ -1,7 +1,7 @@
 //! Integration coverage for the deterministic Runtime Core invariants.
 
 use capability_graph::{CapabilityDefinition, CapabilityValue, Scope};
-use graph_core::Id;
+use kernis_core::Id;
 use runtime_core::{Cancellation, RunId, Runtime, RuntimeError, StepResult, TaskConfig};
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{

@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use capability_graph::{CapabilityDefinition, CapabilityValue, Scope};
-use graph_core::Id;
+use kernis_core::Id;
 use runtime_core::{Cancellation, RunId, Runtime, StepResult, TaskConfig};
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{

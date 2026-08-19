@@ -1,6 +1,6 @@
 //! Semantic tests for the E04 crash/recovery boundary.
 
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::{BTreeMap, BTreeSet};
 use workflow_graph::{Task, WorkflowGraph, WorkflowMutation};
 use workflow_recovery::{

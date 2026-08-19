@@ -8,7 +8,7 @@ use crate::model::{
     AttemptId, DispatchRecord, EffectIntent, KnownEffectOutcome, OperationId, OutcomeRecord,
     RecoveredEffectState,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -18,7 +18,7 @@ pub struct RunId(Id);
 
 impl RunId {
     /// Creates a non-empty run identity.
-    pub fn new(value: impl Into<String>) -> Result<Self, graph_core::InvalidId> {
+    pub fn new(value: impl Into<String>) -> Result<Self, kernis_core::InvalidId> {
         Id::new(value).map(Self)
     }
 
@@ -37,7 +37,7 @@ impl fmt::Display for RunId {
 
 /// Monotonic revision of durable state.
 ///
-/// This is deliberately distinct from `graph_core::Revision`, which belongs
+/// This is deliberately distinct from `kernis_core::Revision`, which belongs
 /// to workflow topology.  A store revision advances for a successful durable
 /// commit, not for a topology mutation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

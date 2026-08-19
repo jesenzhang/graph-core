@@ -4,7 +4,7 @@
 //! policies describe transport behavior only; workflow truth remains in the
 //! workflow and recovery crates.
 
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::VecDeque;
 use std::fmt;
 

@@ -1043,7 +1043,7 @@ impl std::error::Error for ScopeError {}
 mod tests {
     use super::*;
     use crate::Capability;
-    use graph_core::Id;
+    use kernis_core::Id;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;

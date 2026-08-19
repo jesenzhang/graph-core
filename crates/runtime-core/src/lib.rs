@@ -1,4 +1,4 @@
-//! A synchronous, deterministic coordinator for the graph-core structures.
+//! A synchronous, deterministic coordinator for the Kernis runtime structures.
 //!
 //! [`WorkflowGraph`] remains the authority for topology and completion,
 //! [`workflow_recovery::DurableStore`] remains the persistence authority for
@@ -15,7 +15,7 @@ use execution_stream::{
     CoalescingBuffer, KeyedStreamItem, LosslessBuffer, LossyBuffer, PushError, SequenceError,
     StreamItem, StreamSequencer,
 };
-use graph_core::Id;
+use kernis_core::Id;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use workflow_graph::{MutationBatch, WorkflowGraph, WorkflowGraphError, WorkflowMutationRecord};
@@ -576,7 +576,7 @@ impl Runtime {
     /// Applies an atomic workflow mutation through the graph authority.
     pub fn apply_workflow_mutation<B>(
         &mut self,
-        expected_revision: graph_core::Revision,
+        expected_revision: kernis_core::Revision,
         batch: B,
     ) -> Result<WorkflowMutationRecord, RuntimeError>
     where
