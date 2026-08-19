@@ -842,13 +842,30 @@ impl CapabilityFiber {
     /// run before the committed handle is released, so cleanup can still use
     /// the exact dependency snapshot that activated the fiber.
     pub async fn deactivate_for_withdrawal(&self) -> Result<FiberState, FiberError> {
+        self.deactivate_for_withdrawal_with_detached(None).await
+    }
+
+    /// Deactivates a provider fiber whose exact publication was already
+    /// detached by the coordinator's withdrawal guard.
+    pub(crate) async fn deactivate_for_withdrawal_after_detach(
+        &self,
+        detached: &CapabilityHandle,
+    ) -> Result<FiberState, FiberError> {
+        self.deactivate_for_withdrawal_with_detached(Some(detached))
+            .await
+    }
+
+    async fn deactivate_for_withdrawal_with_detached(
+        &self,
+        detached: Option<&CapabilityHandle>,
+    ) -> Result<FiberState, FiberError> {
         self.requested_epoch.fetch_add(1, Ordering::AcqRel);
         let _transition = self.transition.lock().await;
         if self.state() == FiberState::Disposed {
             return Ok(FiberState::Disposed);
         }
         if matches!(self.state(), FiberState::Active | FiberState::Failed) {
-            let errors = self.unload().await;
+            let errors = self.unload(detached).await;
             *self.last_cleanup_errors.lock().await = errors;
         }
         Ok(self.state())
@@ -931,7 +948,7 @@ impl CapabilityFiber {
         if self.state() == FiberState::Disposed {
             return Ok(());
         }
-        let cleanup_errors = self.unload().await;
+        let cleanup_errors = self.unload(None).await;
         self.set_state(FiberState::Disposed);
         if let Some(runtime) = self.runtime.upgrade() {
             runtime.remove_fiber(self.id);
@@ -992,7 +1009,7 @@ impl CapabilityFiber {
             }
 
             if matches!(self.state(), FiberState::Active | FiberState::Failed) {
-                let errors = self.unload().await;
+                let errors = self.unload(None).await;
                 if !errors.is_empty() {
                     *self.last_cleanup_errors.lock().await = errors;
                 }
@@ -1112,12 +1129,12 @@ impl CapabilityFiber {
 
     async fn clear_active_state(&self) {
         if self.state() == FiberState::Active {
-            let errors = self.unload().await;
+            let errors = self.unload(None).await;
             *self.last_cleanup_errors.lock().await = errors;
         }
     }
 
-    async fn unload(&self) -> Vec<EffectError> {
+    async fn unload(&self, detached: Option<&CapabilityHandle>) -> Vec<EffectError> {
         self.set_state(FiberState::Unloading);
         let effects = self
             .effects
@@ -1126,13 +1143,20 @@ impl CapabilityFiber {
             .clone();
         let errors = effects.dispose_all().await;
         if let Some(handle) = self.handle.lock().await.take() {
-            let generation = handle.generation();
-            if let Err(error) = self.context.scope().remove_local(handle.id(), generation) {
-                let mut all = errors;
-                all.push(EffectError::from_scope(error));
-                *self.dependency_epoch.lock().await = None;
-                self.set_state(FiberState::Pending);
-                return all;
+            let was_detached = detached.is_some_and(|detached| {
+                detached.id() == handle.id()
+                    && detached.generation() == handle.generation()
+                    && detached.entry_id() == handle.entry_id()
+            });
+            if !was_detached {
+                let generation = handle.generation();
+                if let Err(error) = self.context.scope().remove_local(handle.id(), generation) {
+                    let mut all = errors;
+                    all.push(EffectError::from_scope(error));
+                    *self.dependency_epoch.lock().await = None;
+                    self.set_state(FiberState::Pending);
+                    return all;
+                }
             }
         }
         *self.dependency_epoch.lock().await = None;

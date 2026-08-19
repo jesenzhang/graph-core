@@ -153,22 +153,28 @@ impl ReactiveCapabilityRuntime {
     /// mutations that happened before the call and never creates replacement
     /// fibers to escape an in-flight lifecycle race.
     pub async fn reconcile(&self) -> ReconcileReport {
-        let fibers = self.snapshot_fibers();
         let mut report = ReconcileReport::default();
-        for fiber in fibers {
-            if !fiber.needs_reconciliation().await {
-                continue;
+        loop {
+            let fibers = self.snapshot_fibers();
+            let mut drove_fiber = false;
+            for fiber in fibers {
+                if !fiber.needs_reconciliation().await {
+                    continue;
+                }
+                drove_fiber = true;
+                report.driven.push(fiber.id());
+                if let Err(error) = fiber.await_stable().await {
+                    report.errors.push(FiberReconcileError {
+                        fiber_id: fiber.id(),
+                        error,
+                    });
+                }
+                append_cleanup_failure(&mut report, &fiber).await;
             }
-            report.driven.push(fiber.id());
-            if let Err(error) = fiber.await_stable().await {
-                report.errors.push(FiberReconcileError {
-                    fiber_id: fiber.id(),
-                    error,
-                });
+            if !drove_fiber {
+                return report;
             }
-            append_cleanup_failure(&mut report, &fiber).await;
         }
-        report
     }
 
     /// Withdraws a provider, drains committed dependents deepest-first, and
@@ -193,7 +199,16 @@ impl ReactiveCapabilityRuntime {
         let mut report = ReconcileReport::default();
         for fiber in ordered {
             report.driven.push(fiber.id());
-            if let Err(error) = fiber.deactivate_for_withdrawal().await {
+            let provider_is_retired_publication =
+                fiber.handle().await.as_ref().is_some_and(|handle| {
+                    identity_of_handle(handle) == identity_of_handle(&retired)
+                });
+            let result = if provider_is_retired_publication {
+                fiber.deactivate_for_withdrawal_after_detach(&retired).await
+            } else {
+                fiber.deactivate_for_withdrawal().await
+            };
+            if let Err(error) = result {
                 report.errors.push(FiberReconcileError {
                     fiber_id: fiber.id(),
                     error,

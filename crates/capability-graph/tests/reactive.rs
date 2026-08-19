@@ -417,3 +417,263 @@ async fn withdrawal_collects_cleanup_failures_and_continues_siblings() {
     assert_eq!(cleaned.load(Ordering::SeqCst), 2);
     assert_eq!(report.cleanup_errors.len(), 2);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_reconcile_reaches_fixpoint_for_reverse_ordered_dependency_chain() {
+    let root = CapabilityContext::root();
+    let reactive = ReactiveCapabilityRuntime::new(root);
+    let a = reactive
+        .provide(definition("a"), |_| Ok(value("a-v1")))
+        .expect("a publishes");
+
+    // Allocate C before B so the first pass examines C while it still sees
+    // B-v1. B then reloads from A-v2 and the same reconcile call must make a
+    // second deterministic pass for C.
+    let c_runtime = plugin(
+        "chain-c",
+        definition("c").depends_on(id("b")),
+        factory(|_| async { Ok(value("c")) }),
+    );
+    let b_runtime = plugin(
+        "chain-b",
+        definition("b").depends_on(id("a")),
+        factory(|context| async move {
+            let a = context
+                .dependencies()
+                .get(&id("a"))
+                .expect("a dependency")
+                .downcast_ref::<String>()
+                .expect("a value")
+                .clone();
+            Ok(value(&format!("b-from-{a}")))
+        }),
+    );
+    register(reactive.registry(), c_runtime);
+    register(reactive.registry(), b_runtime);
+    let c = reactive
+        .instantiate(&id("chain-c"), String::new())
+        .expect("C instantiates first");
+    let b = reactive
+        .instantiate(&id("chain-b"), String::new())
+        .expect("B instantiates second");
+    active(&b).await;
+    active(&c).await;
+    let b_v1 = b.handle().await.expect("B-v1 handle");
+
+    let a_v2 = reactive
+        .replace(definition("a"), a.generation(), |_| Ok(value("a-v2")))
+        .expect("A-v2 publishes");
+    let report = reactive.reconcile().await;
+
+    assert!(report.is_success());
+    assert_eq!(report.driven, vec![b.id(), c.id()]);
+    let b_v2 = b.handle().await.expect("B-v2 handle");
+    let c_v2 = c.handle().await.expect("C-v2 handle");
+    assert_eq!(
+        b.dependency_binding()
+            .await
+            .expect("B binding")
+            .entry_id(&id("a")),
+        Some(a_v2.entry_id())
+    );
+    assert_eq!(
+        c.dependency_binding()
+            .await
+            .expect("C binding")
+            .entry_id(&id("b")),
+        Some(b_v2.entry_id())
+    );
+    assert_ne!(b_v1.entry_id(), b_v2.entry_id());
+    assert_eq!(c_v2.downcast_ref::<String>().map(String::as_str), Some("c"));
+
+    let already_stable = reactive.reconcile().await;
+    assert!(already_stable.driven.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_reconcile_reaches_fixpoint_for_reverse_ordered_diamond() {
+    let root = CapabilityContext::root();
+    let reactive = ReactiveCapabilityRuntime::new(root);
+    let a = reactive
+        .provide(definition("diamond-a"), |_| Ok(value("a-v1")))
+        .expect("A publishes");
+
+    let d_runtime = plugin(
+        "diamond-d",
+        definition("diamond-d")
+            .depends_on(id("diamond-b"))
+            .depends_on(id("diamond-c")),
+        factory(|_| async { Ok(value("d")) }),
+    );
+    let c_runtime = plugin(
+        "diamond-c-plugin",
+        definition("diamond-c").depends_on(id("diamond-a")),
+        factory(|_| async { Ok(value("c")) }),
+    );
+    let b_runtime = plugin(
+        "diamond-b-plugin",
+        definition("diamond-b").depends_on(id("diamond-a")),
+        factory(|_| async { Ok(value("b")) }),
+    );
+    register(reactive.registry(), d_runtime);
+    register(reactive.registry(), c_runtime);
+    register(reactive.registry(), b_runtime);
+    let d = reactive
+        .instantiate(&id("diamond-d"), String::new())
+        .expect("D instantiates first");
+    let c = reactive
+        .instantiate(&id("diamond-c-plugin"), String::new())
+        .expect("C instantiates second");
+    let b = reactive
+        .instantiate(&id("diamond-b-plugin"), String::new())
+        .expect("B instantiates third");
+    active(&b).await;
+    active(&c).await;
+    active(&d).await;
+    let b_v1 = b.handle().await.expect("B-v1 handle");
+    let c_v1 = c.handle().await.expect("C-v1 handle");
+
+    let a_v2 = reactive
+        .replace(definition("diamond-a"), a.generation(), |_| {
+            Ok(value("a-v2"))
+        })
+        .expect("A-v2 publishes");
+    let report = reactive.reconcile().await;
+
+    assert!(report.is_success());
+    assert!(report.driven.contains(&b.id()));
+    assert!(report.driven.contains(&c.id()));
+    assert!(report.driven.contains(&d.id()));
+    let b_v2 = b.handle().await.expect("B-v2 handle");
+    let c_v2 = c.handle().await.expect("C-v2 handle");
+    let d_v2 = d.handle().await.expect("D-v2 handle");
+    assert_eq!(
+        b.dependency_binding()
+            .await
+            .expect("B binding")
+            .entry_id(&id("diamond-a")),
+        Some(a_v2.entry_id())
+    );
+    assert_eq!(
+        c.dependency_binding()
+            .await
+            .expect("C binding")
+            .entry_id(&id("diamond-a")),
+        Some(a_v2.entry_id())
+    );
+    assert_eq!(
+        d.dependency_binding()
+            .await
+            .expect("D binding")
+            .entry_id(&id("diamond-b")),
+        Some(b_v2.entry_id())
+    );
+    assert_eq!(
+        d.dependency_binding()
+            .await
+            .expect("D binding")
+            .entry_id(&id("diamond-c")),
+        Some(c_v2.entry_id())
+    );
+    assert_ne!(b_v1.entry_id(), b_v2.entry_id());
+    assert_ne!(c_v1.entry_id(), c_v2.entry_id());
+    assert!(reactive.reconcile().await.driven.is_empty());
+    drop(d_v2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fiber_provider_withdrawal_skips_only_its_exact_detached_publication() {
+    let root = CapabilityContext::root();
+    let reactive = ReactiveCapabilityRuntime::new(root);
+    let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+    let provider_events = Arc::clone(&events);
+    let provider_cleanup_events = Arc::clone(&events);
+    let provider_runtime = plugin(
+        "fiber-provider",
+        definition("provider"),
+        factory(move |context| {
+            let provider_events = Arc::clone(&provider_events);
+            let provider_cleanup_events = Arc::clone(&provider_cleanup_events);
+            async move {
+                context
+                    .effect(ScopedEffect::sync("provider-effect", move || {
+                        provider_events
+                            .lock()
+                            .expect("events lock")
+                            .push("provider-effect");
+                        Ok(())
+                    }))
+                    .map_err(|error| error.to_string())?;
+                Ok(CapabilityValue::new("provider-v1".to_owned(), move |_| {
+                    provider_cleanup_events
+                        .lock()
+                        .expect("events lock")
+                        .push("provider-value");
+                }))
+            }
+        }),
+    );
+    let consumer_events = Arc::clone(&events);
+    let consumer_runtime = plugin(
+        "fiber-consumer",
+        definition("consumer").depends_on(id("provider")),
+        factory(move |context| {
+            let consumer_events = Arc::clone(&consumer_events);
+            async move {
+                let committed_provider = context
+                    .dependencies()
+                    .get(&id("provider"))
+                    .expect("committed provider")
+                    .clone();
+                context
+                    .effect(ScopedEffect::sync("consumer-effect", move || {
+                        assert_eq!(
+                            committed_provider
+                                .downcast_ref::<String>()
+                                .map(String::as_str),
+                            Some("provider-v1")
+                        );
+                        consumer_events
+                            .lock()
+                            .expect("events lock")
+                            .push("consumer");
+                        Ok(())
+                    }))
+                    .map_err(|error| error.to_string())?;
+                Ok(value("consumer"))
+            }
+        }),
+    );
+    register(reactive.registry(), provider_runtime);
+    register(reactive.registry(), consumer_runtime);
+    let provider = reactive
+        .instantiate(&id("fiber-provider"), String::new())
+        .expect("provider fiber instantiates");
+    let consumer = reactive
+        .instantiate(&id("fiber-consumer"), String::new())
+        .expect("consumer fiber instantiates");
+    active(&provider).await;
+    active(&consumer).await;
+    let provider_generation = provider
+        .handle()
+        .await
+        .expect("provider publication")
+        .generation();
+
+    let report = reactive
+        .withdraw_and_reconcile(&id("provider"), provider_generation)
+        .await
+        .expect("provider withdrawal");
+
+    assert!(report.is_success());
+    assert!(report.errors.is_empty());
+    assert!(report.cleanup_errors.is_empty());
+    assert_eq!(report.driven, vec![consumer.id(), provider.id()]);
+    assert_eq!(provider.state(), FiberState::Pending);
+    assert_eq!(consumer.state(), FiberState::Pending);
+    assert_eq!(
+        events.lock().expect("events lock").as_slice(),
+        &["consumer", "provider-effect", "provider-value"]
+    );
+}
