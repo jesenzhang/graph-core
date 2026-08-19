@@ -419,6 +419,79 @@ async fn withdrawal_collects_cleanup_failures_and_continues_siblings() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn successful_reactivation_from_pending_clears_previous_cleanup_errors() {
+    let root = CapabilityContext::root();
+    let reactive = ReactiveCapabilityRuntime::new(root);
+    let provider = reactive
+        .provide(definition("model"), |_| Ok(value("v1")))
+        .expect("v1 publishes");
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let cleanup_calls_for_factory = Arc::clone(&cleanup_calls);
+    let consumer_runtime = plugin(
+        "pending-reactivation-consumer",
+        definition("pending-reactivation-consumer").depends_on(id("model")),
+        factory(move |context| {
+            let cleanup_calls = Arc::clone(&cleanup_calls_for_factory);
+            async move {
+                context
+                    .effect(ScopedEffect::sync(
+                        "pending-reactivation-cleanup",
+                        move || {
+                            if cleanup_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Err("withdrawal cleanup failed".to_owned())
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ))
+                    .map_err(|error| error.to_string())?;
+                Ok(value("consumer"))
+            }
+        }),
+    );
+    register(reactive.registry(), consumer_runtime);
+    let consumer = reactive
+        .instantiate(&id("pending-reactivation-consumer"), String::new())
+        .expect("consumer instantiates");
+    active(&consumer).await;
+    let provider_generation = provider.generation();
+    drop(provider);
+
+    let withdrawal_report = reactive
+        .withdraw_and_reconcile(&id("model"), provider_generation)
+        .await
+        .expect("withdrawal reports cleanup failure");
+    assert_eq!(consumer.state(), FiberState::Pending);
+    assert_eq!(withdrawal_report.cleanup_errors.len(), 1);
+    assert!(!withdrawal_report.is_success());
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+    let v2 = reactive
+        .provide(definition("model"), |_| Ok(value("v2")))
+        .expect("v2 publishes");
+    let report = reactive.reconcile().await;
+    assert_eq!(consumer.state(), FiberState::Active);
+    assert!(report.errors.is_empty());
+    assert!(report.cleanup_errors.is_empty());
+    assert!(report.is_success());
+    assert_eq!(
+        consumer
+            .dependency_binding()
+            .await
+            .expect("consumer binding")
+            .entry_id(&id("model")),
+        Some(v2.entry_id())
+    );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+    let stable = reactive.reconcile().await;
+    assert!(stable.driven.is_empty());
+    assert!(stable.cleanup_errors.is_empty());
+
+    drop(v2);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn replacement_reaches_transitive_fixed_point_independent_of_fiber_id_order() {
     let root = CapabilityContext::root();
     let reactive = ReactiveCapabilityRuntime::new(root);

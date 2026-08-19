@@ -979,6 +979,9 @@ impl CapabilityFiber {
         }
         let requested_force = self.force_reload.swap(false, Ordering::AcqRel);
         let force = force || requested_force;
+        if self.state() == FiberState::Pending {
+            *self.last_cleanup_errors.lock().await = Vec::new();
+        }
 
         loop {
             let dependencies = match self
