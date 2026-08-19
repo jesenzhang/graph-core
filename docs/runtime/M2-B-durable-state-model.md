@@ -1,6 +1,7 @@
 # M2-B Durable State Model
 
-Status: M2-B0 complete; M2-B1 not started
+Status: M2-B0 complete; M2-B1 in-memory durable-store/restart slice
+implemented; concrete physical persistence adapter not started
 
 This document defines the boundary between durable correctness state and
 process-local runtime state. The default rule is:
@@ -20,9 +21,9 @@ process-local runtime state. The default rule is:
 | Durable | Attempt identity | `AttemptId` is historical and never reused for a new external dispatch. |
 | Durable | Cancellation fact | Cancellation is retained and interpreted against the latest dispatch. |
 | Durable | Recovery classification inputs | Intent, dispatch, outcome, semantics, ownership, and revisions are sufficient inputs to classify recovery. |
-| Durable | Capability replay/config identity when required | Persist the logical capability identity, generation/config identity, and entry identity needed to explain a replay; do not persist a live handle. |
-| Reconstructable | `CapabilityContext` | Rebuild from durable capability configuration and scope topology. |
-| Reconstructable | Registry runtime cache | Re-register runtime metadata; registry membership is not the workflow authority. |
+| Durable | Capability replay/config identity when required | Persist the stable logical capability identity needed to validate a replay; the process-local pin continues to retain exact `Generation` and `EntryId`, but no live handle is durable. |
+| Reconstructable | `CapabilityContext` and `ReactiveCapabilityRuntime` | Rebuild one fresh Runtime-owned coordinator from supplied capability configuration and scope topology. |
+| Reconstructable | Registry runtime cache | Re-register runtime metadata in the fresh coordinator; registry membership is not the workflow authority. |
 | Reconstructable | Fiber instances | Recreate from configuration and durable facts; do not deserialize old Fibers. |
 | Reconstructable | Effect stacks | Recreate only for the current process epoch; old disposer closures are not replayed as objects. |
 | Reconstructable | Capability handles | Re-resolve or reconcile against the pinned identity; a live pointer is never durable. |
@@ -160,7 +161,7 @@ merged under one generic retry API.
 ## M2-B1 implementation status
 
 The first M2-B1 slice is implemented with a synchronous typed
-`DurableStore` seam and deterministic `InMemoryDurableStore` adapter.  Its
+`DurableStore` seam and deterministic `InMemoryDurableStore` adapter. Its
 `StoreRevision` is independent from workflow topology revision.  Attempt
 admission is an append-only fact before `TaskStarted`; dispatch and outcome
 facts retain exact `AttemptId` lineage, and recovery authority follows the
@@ -169,9 +170,10 @@ and conflicting cancellation lineage is rejected without rewriting prior
 facts.  Capability replay identity is stored separately from process-local
 generation, `EntryId`, and live handles.
 
-Runtime restart tests reconstruct a new runtime from a cloned durable store
-view with fresh streams and capability handles.  No physical persistence
-adapter is selected in this milestone.
+Runtime restart tests reconstruct a new Runtime-owned reactive coordinator
+from a cloned durable store view with fresh streams, registry state, fibers,
+and capability handles. No physical persistence adapter is selected in this
+milestone.
 
 ## M2-B1 follow-up boundaries
 

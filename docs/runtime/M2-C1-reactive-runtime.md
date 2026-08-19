@@ -1,11 +1,13 @@
 # M2-C1 Reactive Coeffect Runtime
 
-## Candidate
+## Integrated status
 
-- Base: `c404ae73041d2855062a55c2b8d6efa91d81fb3f`
-- Scope: reactive capability lifecycle repair; M2-B0 durable replay-head
-  boundary remains a separate completed milestone
-- Owner: `capability-graph`; `runtime-core` remains the durable/task coordinator
+- Status: M2-C1 Integrated / Closed
+- Main: `589827af0156fa0d3f25f5bb6f4044f2be61b527`
+- Scope: reactive capability lifecycle repair; M2-B durable replay authority
+  remains a separate boundary
+- Owner: `capability-graph`, composed by the Runtime-owned coordinator in
+  `runtime-core`
 
 ## Semantic mapping
 
@@ -18,9 +20,24 @@
 | Withdrawal | Dependents quiesce before provider recovery | Hide provider, unload consumers, await fibers, then recover provider | `Scope::withdraw()` returns a temporary provider guard; the coordinator drains affected fibers deepest-first before dropping it |
 | Failure isolation | One cleanup failure does not prevent sibling cleanup | Fiber cleanup continues across disposers | `ReconcileReport` retains lifecycle and cleanup failures structurally |
 
-`Scope` remains a low-level ownership/admission primitive. Reactive callers use
-`ReactiveCapabilityRuntime` and an explicit async reconciliation boundary rather
-than relying on a generic event bus or background task.
+`Runtime` owns one `ReactiveCapabilityRuntime`; its scope, context, registry,
+and watched fibers are one process-local capability ownership boundary.
+`Runtime::scope()`, `capability_context()`, and `capability_registry()` are
+compatibility views over that coordinator. Reactive callers use
+`Runtime::capability_runtime()` and its explicit async reconciliation boundary
+rather than relying on a generic event bus or background task.
+
+Direct `Scope::provide`, `Scope::replace`, and `Scope::withdraw` operations are
+low-level mutations. They do not automatically guarantee reactive dependent
+fixed-point convergence. When a capability mutation should affect new task
+admission, the contract is:
+
+```text
+mutation -> explicit async reconcile -> Runtime::step()
+```
+
+`Runtime::step()` remains a synchronous deterministic admission boundary and
+does not run arbitrary plugin reconciliation.
 
 M2-C1 assumes serialized mutation/reconciliation ownership for one
 `ReactiveCapabilityRuntime`. Concurrent multi-writer mutation ordering is not a
@@ -44,9 +61,11 @@ The reactive integration tests cover:
 - provider-fiber withdrawal without double-removing its exact detached entry;
 - idempotent repeated withdrawal.
 
-The runtime-core cross-boundary test shares one `Scope` with the reactive
-coordinator: attempt A retains V1, the dependent fiber converges to V2, and a
-new attempt B resolves V2. No existing `TaskAttempt` pin is mutated.
+The Runtime-owned cross-boundary tests cover a single registry/coordinator
+ownership boundary, withdrawal, restart reconstruction, and durable authority:
+attempt A retains exact V1 `Generation + EntryId + replay identity`, the
+dependent fiber converges to exact V2, and a new attempt B resolves V2. No
+existing `TaskAttempt` pin is mutated.
 
 The existing lifecycle tests continue to cover replacement during unloading,
 stale load errors, disposal during loading, and same-fiber restart.
@@ -77,7 +96,8 @@ valid CAS head after replaying an old successful commit.
   coordinator-owned retirement guard was released. It does not mean that all
   external `CapabilityHandle`s were dropped or that `CapabilityValue` cleanup
   necessarily ran.
-- The coordinator is process-local and in-memory; no distributed watcher or
+- The coordinator is process-local and in-memory; restore creates a fresh
+  coordinator from supplied scope/configuration. No distributed watcher or
   durable fiber serialization is introduced.
 - Cleanup failure policy is deterministic continuation plus structural
   reporting. Provider finalization still occurs after the affected fibers

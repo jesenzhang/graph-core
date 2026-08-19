@@ -10,10 +10,12 @@ Research Baseline v0 is complete. M1 Runtime Core is implemented as a
 synchronous, single-process, deterministic coordinator over the validated
 structures. M2-A adds a process-local asynchronous Capability Runtime for
 Cordis-derived context, registry, fiber, and effect semantics. M2-B0 defines
-the durable runtime boundary, and M2-C1 adds an explicit reactive capability
-coordinator with fixed-point replacement and quiescent provider withdrawal.
-There is still no concrete persistence adapter, provider SDK, dynamic plugin
-loader, or distributed execution.
+the durable runtime boundary and the M2-B1 in-memory durable-store/restart
+slice is implemented. M2-C1 adds an explicit reactive capability coordinator
+with fixed-point replacement and quiescent provider withdrawal. M2-C2
+integrates that coordinator as Runtime Core's single capability owner. There
+is still no concrete physical persistence adapter, provider SDK, dynamic
+plugin loader, or distributed execution.
 
 ## Why this exists
 
@@ -63,16 +65,23 @@ in-flight M1 attempts. See [`docs/research/CORDIS_PORT_MATRIX.md`](docs/research
 [`docs/architecture/0003-cordis-semantic-port-decisions.md`](docs/architecture/0003-cordis-semantic-port-decisions.md),
 and [`docs/runtime/M2-B-handoff.md`](docs/runtime/M2-B-handoff.md).
 
-## M2-B durable boundary and M2-C1 reactive runtime
+## M2-B durable boundary and M2-C2 runtime capability boundary
 
 M2-B0 keeps durable workflow/effect facts separate from process-local Fiber
-state; concrete durable storage remains a later M2-B1 task. M2-C1 provides
-explicit `ReactiveCapabilityRuntime` mutation and reconciliation helpers. A
-single reconciliation call reaches the latest transitive dependency fixpoint,
-and provider withdrawal drains affected dependents before releasing the exact
-retirement guard. These semantics assume serialized mutation/reconciliation
-ownership for one reactive runtime; concurrent multi-writer ordering is not
-claimed.
+state. M2-B1's first slice provides a synchronous typed `DurableStore` seam,
+an `InMemoryDurableStore`, attempt admission, dispatch/outcome lineage, and
+restart reconstruction; a concrete physical persistence adapter is not
+started. M2-C1 provides explicit `ReactiveCapabilityRuntime` mutation and
+reconciliation helpers. M2-C2 makes one Runtime-owned coordinator the
+capability boundary, with compatibility accessors delegating to that same
+context and registry. A single reconciliation call reaches the latest
+transitive dependency fixpoint, and provider withdrawal drains affected
+dependents before releasing the exact retirement guard.
+
+`Runtime::step()` remains synchronous and does not reconcile reactive state.
+Callers use `capability_runtime()` for mutation, then cross the explicit async
+`reconcile()` boundary before a new task admission. Existing attempts retain
+their exact capability handles; replacement changes only future resolution.
 
 ## First commands
 

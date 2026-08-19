@@ -1,7 +1,8 @@
 # M2-B Handoff: Durable Runtime Extension
 
-Status: M2-B0 complete; M2-B1 not started; M2-C1 reactive runtime in
-fix-forward review
+Status: M2-B0 complete; M2-B1 in-memory durable-store/restart slice
+implemented; concrete physical persistence adapter not started; M2-C1
+Integrated / Closed at `589827af0156fa0d3f25f5bb6f4044f2be61b527`
 
 M2-A keeps Cordis-derived Context, Registry, Fiber, and Effect state
 process-local. The next milestone must persist authoritative facts without
@@ -36,5 +37,7 @@ old Fiber pointers, disposers, mutexes, or async tasks.
 
 M2-B must preserve M1's latest-dispatch authority, late-outcome rejection,
 exact `AttemptId` identity, capability pinning for in-flight attempts, and the
-separation between WorkflowGraph, DurableJournal, Capability Runtime, and
-Execution Streams.
+separation between WorkflowGraph, DurableJournal, the Runtime-owned reactive
+capability coordinator, and Execution Streams. Reactive replacement and
+withdrawal are process-local lifecycle changes; they do not rewrite durable
+operation, attempt, or replay/config identity.

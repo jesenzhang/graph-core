@@ -1,8 +1,11 @@
 # Cordis Port Matrix
 
-Status: M2-C1 review-repair candidate; M2-B0 durable boundary complete; M2-B1 not started
+Status: M2-C1 Integrated / Closed at main
+`589827af0156fa0d3f25f5bb6f4044f2be61b527`; M2-B0 durable boundary complete;
+M2-B1 in-memory durable-store/restart slice implemented; concrete physical
+persistence adapter not started
 
-## M2-C1 review-repair state
+## M2-C1 integrated state
 
 - M2-C1 adds an explicit reactive capability coordinator over the M2-A
   process-local runtime.
@@ -11,8 +14,12 @@ Status: M2-C1 review-repair candidate; M2-B0 durable boundary complete; M2-B1 no
 - Provider withdrawal removes the exact publication from future resolution,
   drains affected dependents deepest-first, and uses an exact
   `Generation + EntryId` guard for a watched provider fiber.
-- M2-B0 defines the durable runtime boundary; concrete persistent storage and
-  M2-B1 implementation remain outside this candidate.
+- M2-B0 defines the durable runtime boundary; M2-B1 provides the first
+  synchronous in-memory durable-store/restart slice. Concrete persistent
+  storage remains outside this milestone.
+- M2-C2 composes the coordinator into Runtime Core. Runtime owns one
+  `ReactiveCapabilityRuntime`, and its compatibility context/registry views
+  delegate to that same ownership boundary.
 
 ## M2-A closeout
 
@@ -22,7 +29,7 @@ Status: M2-C1 review-repair candidate; M2-B0 durable boundary complete; M2-B1 no
 - Integrated main CI: run `32110400912`, PASS.
 - Cordis baseline: `cordiverse/cordis` commit
   `8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4`.
-- Known follow-ups: M2-B1 durable-store implementation and broader Cordis
+- Known follow-ups: concrete physical persistence and broader Cordis
   metatheory; distributed propagation, durable fiber replay, and concurrent
   multi-writer ordering remain out of scope.
 
@@ -114,7 +121,7 @@ compatibility rule.
 | `inject` | explicit `Requirement` list | PORT | implemented |
 | provider-identity target | `DependencyEpoch` over `Generation`/`EntryId` | PORT | implemented |
 | committed dependency view | `ResolvedDependencies` + retained handles | PORT | implemented for identity/lifetime |
-| reactive context-change propagation | watched fibers plus explicit `ReactiveCapabilityRuntime::reconcile()` | PORT | implemented with deterministic fixed-point reconciliation; no background watcher |
+| reactive context-change propagation | watched fibers plus explicit `ReactiveCapabilityRuntime::reconcile()` | PORT | implemented with deterministic fixed-point reconciliation; Runtime Core owns one coordinator; no background watcher |
 | provider-withdrawal dependent drain | exact detach guard plus deepest-first quiescent drain | PORT | implemented; `Generation + EntryId` prevents provider-fiber double removal |
 | `effect` | `ScopedEffect` | PORT | implemented |
 | `DisposableList` | `EffectStack` | PORT | implemented with stricter sequential LIFO |
@@ -184,11 +191,13 @@ attempt carries an epoch token; completion publishes only when the token and
 exact dependencies are still current. This is the Rust counterpart to the
 paper's target/committed-view identity rule.
 
-The reactive boundary is explicit through `ReactiveCapabilityRuntime` mutation
-helpers and `reconcile()`. M2-C1 proves stale-publication rejection, one-call
-transitive fixed-point convergence, and neutral behavior for unrelated or
-isolated mutations. It does not claim that arbitrary raw `Scope` mutation is an
-automatic event source.
+The reactive boundary is explicit through Runtime-owned
+`ReactiveCapabilityRuntime` mutation helpers and `reconcile()`. M2-C1 proves
+stale-publication rejection, one-call transitive fixed-point convergence, and
+neutral behavior for unrelated or isolated mutations. It does not claim that
+arbitrary raw `Scope` mutation is an automatic event source. `Runtime::step()`
+is synchronous and does not perform reconciliation; callers cross the async
+reconciliation boundary before new task admission.
 
 Compatibility tests: every Stage 3 transition, dependency replacement while
 loading/unloading, restart, update, failed initialization, stable-state await,
