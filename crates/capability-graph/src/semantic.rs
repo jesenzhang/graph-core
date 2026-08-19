@@ -1010,9 +1010,7 @@ impl CapabilityFiber {
 
             if matches!(self.state(), FiberState::Active | FiberState::Failed) {
                 let errors = self.unload(None).await;
-                if !errors.is_empty() {
-                    *self.last_cleanup_errors.lock().await = errors;
-                }
+                *self.last_cleanup_errors.lock().await = errors;
                 if self.dispose_requested.load(Ordering::Acquire) {
                     return Err(FiberError::Disposed);
                 }

@@ -419,7 +419,7 @@ async fn withdrawal_collects_cleanup_failures_and_continues_siblings() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn one_reconcile_reaches_fixpoint_for_reverse_ordered_dependency_chain() {
+async fn replacement_reaches_transitive_fixed_point_independent_of_fiber_id_order() {
     let root = CapabilityContext::root();
     let reactive = ReactiveCapabilityRuntime::new(root);
     let a = reactive
@@ -460,10 +460,10 @@ async fn one_reconcile_reaches_fixpoint_for_reverse_ordered_dependency_chain() {
     active(&c).await;
     let b_v1 = b.handle().await.expect("B-v1 handle");
 
-    let a_v2 = reactive
-        .replace(definition("a"), a.generation(), |_| Ok(value("a-v2")))
-        .expect("A-v2 publishes");
-    let report = reactive.reconcile().await;
+    let (a_v2, report) = reactive
+        .replace_and_reconcile(definition("a"), a.generation(), |_| Ok(value("a-v2")))
+        .await
+        .expect("A-v2 publishes and reconciliation reaches a fixpoint");
 
     assert!(report.is_success());
     assert_eq!(report.driven, vec![b.id(), c.id()]);
@@ -488,6 +488,73 @@ async fn one_reconcile_reaches_fixpoint_for_reverse_ordered_dependency_chain() {
 
     let already_stable = reactive.reconcile().await;
     assert!(already_stable.driven.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn successful_replacement_clears_previous_cleanup_errors() {
+    let root = CapabilityContext::root();
+    let reactive = ReactiveCapabilityRuntime::new(root);
+    let provider = reactive
+        .provide(definition("model"), |_| Ok(value("v1")))
+        .expect("v1 publishes");
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let cleanup_calls_for_factory = Arc::clone(&cleanup_calls);
+    let consumer_runtime = plugin(
+        "cleanup-consumer",
+        definition("cleanup-consumer").depends_on(id("model")),
+        factory(move |context| {
+            let cleanup_calls = Arc::clone(&cleanup_calls_for_factory);
+            async move {
+                context
+                    .effect(ScopedEffect::sync("replacement-cleanup", move || {
+                        if cleanup_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err("first cleanup failed".to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    }))
+                    .map_err(|error| error.to_string())?;
+                Ok(value("consumer"))
+            }
+        }),
+    );
+    register(reactive.registry(), consumer_runtime);
+    let consumer = reactive
+        .instantiate(&id("cleanup-consumer"), String::new())
+        .expect("consumer instantiates");
+    active(&consumer).await;
+
+    let (v2, first_report) = reactive
+        .replace_and_reconcile(definition("model"), provider.generation(), |_| {
+            Ok(value("v2"))
+        })
+        .await
+        .expect("v2 publishes and reconciles");
+    assert!(!first_report.is_success());
+    assert_eq!(first_report.cleanup_errors.len(), 1);
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+    let (v3, second_report) = reactive
+        .replace_and_reconcile(definition("model"), v2.generation(), |_| Ok(value("v3")))
+        .await
+        .expect("v3 publishes and reconciles");
+    assert!(second_report.is_success());
+    assert!(second_report.cleanup_errors.is_empty());
+    assert_eq!(second_report.driven, vec![consumer.id()]);
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(consumer.state(), FiberState::Active);
+    assert_eq!(
+        consumer
+            .dependency_binding()
+            .await
+            .expect("consumer binding")
+            .entry_id(&id("model")),
+        Some(v3.entry_id())
+    );
+
+    drop(provider);
+    drop(v2);
+    drop(v3);
 }
 
 #[tokio::test(flavor = "current_thread")]

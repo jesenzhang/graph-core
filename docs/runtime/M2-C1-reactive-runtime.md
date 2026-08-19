@@ -3,7 +3,8 @@
 ## Candidate
 
 - Base: `c404ae73041d2855062a55c2b8d6efa91d81fb3f`
-- Scope: durable replay-head repair plus reactive capability lifecycle
+- Scope: reactive capability lifecycle repair; M2-B0 durable replay-head
+  boundary remains a separate completed milestone
 - Owner: `capability-graph`; `runtime-core` remains the durable/task coordinator
 
 ## Semantic mapping
@@ -21,6 +22,10 @@
 `ReactiveCapabilityRuntime` and an explicit async reconciliation boundary rather
 than relying on a generic event bus or background task.
 
+M2-C1 assumes serialized mutation/reconciliation ownership for one
+`ReactiveCapabilityRuntime`. Concurrent multi-writer mutation ordering is not a
+claimed semantic guarantee.
+
 ## Proven behaviors
 
 The reactive integration tests cover:
@@ -34,6 +39,8 @@ The reactive integration tests cover:
 - committed old-provider access during dependent teardown;
 - `C -> B -> A` withdrawal order and provider cleanup after dependents;
 - cleanup-failure collection without skipping sibling dependents;
+- cleanup failures from a transition are replaced by the latest relevant
+  transition's cleanup result;
 - provider-fiber withdrawal without double-removing its exact detached entry;
 - idempotent repeated withdrawal.
 
@@ -65,6 +72,11 @@ valid CAS head after replaying an old successful commit.
 - Raw `Scope` mutations do not run background reconciliation. Callers claiming
   reactive semantics must use the coordinator's mutation methods and call the
   explicit async boundary.
+- `ReconcileReport::provider_finalized` means that the provider was removed
+  from future resolution, affected reactive dependents were quiesced, and the
+  coordinator-owned retirement guard was released. It does not mean that all
+  external `CapabilityHandle`s were dropped or that `CapabilityValue` cleanup
+  necessarily ran.
 - The coordinator is process-local and in-memory; no distributed watcher or
   durable fiber serialization is introduced.
 - Cleanup failure policy is deterministic continuation plus structural

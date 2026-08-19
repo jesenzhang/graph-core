@@ -437,7 +437,11 @@ pub struct ReconcileReport {
     pub errors: Vec<FiberReconcileError>,
     /// Cleanup failures collected without changing provider finalization order.
     pub cleanup_errors: Vec<FiberCleanupFailure>,
-    /// Whether a withdrawal completed its provider-finalization boundary.
+    /// Whether a withdrawal completed the coordinator-owned provider-finalization
+    /// boundary: the provider was removed from future resolution, affected
+    /// reactive dependents were quiesced, and the retirement guard was released.
+    /// This does not mean all external [`CapabilityHandle`] values were dropped
+    /// or that [`CapabilityValue`] cleanup necessarily ran.
     pub provider_finalized: bool,
 }
 

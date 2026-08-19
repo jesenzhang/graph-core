@@ -1,6 +1,7 @@
 # M2-B Handoff: Durable Runtime Extension
 
-Status: M2-A integrated; M2-B0 not started
+Status: M2-B0 complete; M2-B1 not started; M2-C1 reactive runtime in
+fix-forward review
 
 M2-A keeps Cordis-derived Context, Registry, Fiber, and Effect state
 process-local. The next milestone must persist authoritative facts without

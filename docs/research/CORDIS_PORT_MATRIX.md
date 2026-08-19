@@ -1,6 +1,18 @@
 # Cordis Port Matrix
 
-Status: M2-A Integrated
+Status: M2-C1 review-repair candidate; M2-B0 durable boundary complete; M2-B1 not started
+
+## M2-C1 review-repair state
+
+- M2-C1 adds an explicit reactive capability coordinator over the M2-A
+  process-local runtime.
+- Reactive replacement uses deterministic fixed-point reconciliation, including
+  transitive dependents and reverse-ordered fiber identities.
+- Provider withdrawal removes the exact publication from future resolution,
+  drains affected dependents deepest-first, and uses an exact
+  `Generation + EntryId` guard for a watched provider fiber.
+- M2-B0 defines the durable runtime boundary; concrete persistent storage and
+  M2-B1 implementation remain outside this candidate.
 
 ## M2-A closeout
 
@@ -10,8 +22,9 @@ Status: M2-A Integrated
 - Integrated main CI: run `32110400912`, PASS.
 - Cordis baseline: `cordiverse/cordis` commit
   `8cc9e33fab69e2d0476d126baaf2acb24e6a6ab4`.
-- Known follow-ups: M2-B0 durability reference mapping and durable-state
-  boundary design; persistence implementation remains out of scope.
+- Known follow-ups: M2-B1 durable-store implementation and broader Cordis
+  metatheory; distributed propagation, durable fiber replay, and concurrent
+  multi-writer ordering remain out of scope.
 
 This matrix freezes the reference used for the semantic port. “PORT” means
 the behavioral invariant is implemented in Rust with an explicit Rust API;
@@ -31,10 +44,11 @@ what M2-A proves:
 1. `DependencyEpoch` plus exact `Generation`/`EntryId` is a strong Rust
    counterpart to Cordis's provider-identity target and committed dependency
    view.
-2. M2-A exposes `CapabilityFiber::notify_dependency_change()`, but the
-   inspected `Scope::provide/replace/remove` paths do not themselves implement
-   Cordis's full automatic context-change notification chain. Full reactive
-   coeffect propagation therefore remains a separate semantic target.
+2. M2-A exposed `CapabilityFiber::notify_dependency_change()`. M2-C1 now
+   provides the explicit `ReactiveCapabilityRuntime` propagation boundary:
+   watched fibers are reconciled to a deterministic transitive fixpoint, while
+   raw scope mutations still do not create a generic event bus or background
+   watcher.
 3. `Scope::teardown()` gives deterministic dependency-aware release and exact
    snapshot lifetime, but Cordis provider withdrawal additionally hides the
    provider from future resolution, drives committed consumers through their
@@ -100,8 +114,8 @@ compatibility rule.
 | `inject` | explicit `Requirement` list | PORT | implemented |
 | provider-identity target | `DependencyEpoch` over `Generation`/`EntryId` | PORT | implemented |
 | committed dependency view | `ResolvedDependencies` + retained handles | PORT | implemented for identity/lifetime |
-| automatic context-change notification | explicit `notify_dependency_change()` | STUDY | partial; automatic propagation not proven |
-| provider-withdrawal dependent drain | scope order + exact snapshot lifetime | STUDY | partial; live withdrawal protocol not proven |
+| reactive context-change propagation | watched fibers plus explicit `ReactiveCapabilityRuntime::reconcile()` | PORT | implemented with deterministic fixed-point reconciliation; no background watcher |
+| provider-withdrawal dependent drain | exact detach guard plus deepest-first quiescent drain | PORT | implemented; `Generation + EntryId` prevents provider-fiber double removal |
 | `effect` | `ScopedEffect` | PORT | implemented |
 | `DisposableList` | `EffectStack` | PORT | implemented with stricter sequential LIFO |
 | `restart` | `CapabilityFiber::restart` | PORT | implemented |
@@ -170,11 +184,11 @@ attempt carries an epoch token; completion publishes only when the token and
 exact dependencies are still current. This is the Rust counterpart to the
 paper's target/committed-view identity rule.
 
-Important limit: dependency-change signaling is currently explicit through
-`notify_dependency_change()`. M2-A proves stale-publication rejection and
-same-fiber convergence when driven, but it does not by itself prove that every
-`Scope` mutation automatically discovers and drives all affected dependent
-fibers.
+The reactive boundary is explicit through `ReactiveCapabilityRuntime` mutation
+helpers and `reconcile()`. M2-C1 proves stale-publication rejection, one-call
+transitive fixed-point convergence, and neutral behavior for unrelated or
+isolated mutations. It does not claim that arbitrary raw `Scope` mutation is an
+automatic event source.
 
 Compatibility tests: every Stage 3 transition, dependency replacement while
 loading/unloading, restart, update, failed initialization, stable-state await,
@@ -215,17 +229,29 @@ committed to it, while those consumers retain access to their committed
 binding during teardown. Provider recovery runs only after those dependents
 have quiesced.
 
-graph-core currently has two related but distinct mechanisms:
+graph-core currently has two related but distinct mechanisms, with M2-C1 adding
+the live coordinator protocol:
 
 - `Scope::teardown()` stops new lookup/mutation and releases local ownership in
   deterministic dependency order;
 - each published entry retains exact dependency handles, so old provider
   instances remain alive while dependents/readers hold snapshots.
+- `ReactiveCapabilityRuntime::withdraw_and_reconcile()` first removes the exact
+  publication from future resolution, then drains affected dependents deepest
+  first, and releases the coordinator-owned retirement guard only after the
+  affected fibers are stable. A watched provider fiber skips `remove_local`
+  only when capability id, generation, and entry id prove that this exact
+  publication was already detached.
 
-Those mechanisms provide strong identity/lifetime safety but do not alone
-prove Cordis's live withdrawal protocol. Automatic reactive notification and
-dependent quiescence are retained as follow-up semantics rather than silently
-claimed as part of M2-A.
+`ReconcileReport::provider_finalized` therefore reports the coordinator-owned
+provider-finalization boundary. It does not assert that all external handles
+were dropped or that capability-value cleanup necessarily ran. Cleanup errors
+are structurally reported for the latest relevant transition; a later
+successful transition does not inherit an earlier cleanup failure.
+
+M2-C1 assumes serialized mutation/reconciliation ownership for one
+`ReactiveCapabilityRuntime`. Concurrent multi-writer mutation ordering is not a
+claimed semantic guarantee.
 
 ### System boundary and durability
 
