@@ -266,6 +266,40 @@ fn identical_commit_replay_does_not_advance_revision() {
 }
 
 #[test]
+fn replay_after_newer_commit_returns_live_head_for_the_next_cas() {
+    let mut store = InMemoryDurableStore::new();
+    store.create_run(run()).expect("run creates");
+    let first_request = CommitRequest::single(
+        run(),
+        StoreRevision::INITIAL,
+        key("first"),
+        DurableMutation::AdmitAttempt(admission(&attempt("attempt-1"), None)),
+    );
+    let first = store.commit(first_request.clone()).expect("first commit");
+    let newer = store
+        .commit(CommitRequest::single(
+            run(),
+            first.revision,
+            key("newer"),
+            DurableMutation::AdmitAttempt(admission(&attempt("attempt-2"), None)),
+        ))
+        .expect("newer commit");
+
+    let replay = store.commit(first_request).expect("replay commit");
+    assert!(replay.replayed);
+    assert_eq!(replay.revision, newer.revision);
+
+    store
+        .commit(CommitRequest::single(
+            run(),
+            replay.revision,
+            key("after-replay"),
+            DurableMutation::AdmitAttempt(admission(&attempt("attempt-3"), None)),
+        ))
+        .expect("live replay head remains valid for the next CAS");
+}
+
+#[test]
 fn outcome_requires_admitted_dispatched_attempt_and_cannot_conflict() {
     let mut store = InMemoryDurableStore::new();
     store.create_run(run()).expect("run creates");

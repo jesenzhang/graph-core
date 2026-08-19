@@ -1124,3 +1124,58 @@ fn drain_lossy<T>(buffer: &mut LossyBuffer<T>) -> Vec<StreamItem<T>> {
     }
     items
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admitted(run_id: &RunId, attempt: &str) -> AttemptAdmission {
+        AttemptAdmission {
+            run_id: run_id.clone(),
+            task_id: Id::new("task").expect("test id is valid"),
+            attempt_id: AttemptId::new(attempt).expect("test attempt is valid"),
+            operation_id: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn runtime_durable_head_does_not_regress_on_old_replay() {
+        let run_id = RunId::new("runtime-replay").expect("test run is valid");
+        let mut runtime = Runtime::start_run(
+            run_id.clone(),
+            WorkflowGraph::default(),
+            Scope::root(),
+            std::iter::empty::<(Id, TaskConfig)>(),
+        )
+        .expect("runtime starts");
+        let first = DurableMutation::AdmitAttempt(admitted(&run_id, "attempt-1"));
+        let first_revision = runtime
+            .commit_durable("first".to_owned(), vec![first.clone()])
+            .expect("first commit");
+        let newer_revision = runtime
+            .commit_durable(
+                "newer".to_owned(),
+                vec![DurableMutation::AdmitAttempt(admitted(
+                    &run_id,
+                    "attempt-2",
+                ))],
+            )
+            .expect("newer commit");
+        let replay_revision = runtime
+            .commit_durable("first".to_owned(), vec![first])
+            .expect("replay commit");
+
+        assert_eq!(first_revision.get() + 1, newer_revision.get());
+        assert_eq!(replay_revision, newer_revision);
+        runtime
+            .commit_durable(
+                "after-replay".to_owned(),
+                vec![DurableMutation::AdmitAttempt(admitted(
+                    &run_id,
+                    "attempt-3",
+                ))],
+            )
+            .expect("next mutation uses the live replay head");
+    }
+}

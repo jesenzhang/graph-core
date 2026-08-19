@@ -211,10 +211,13 @@ impl CapabilityContext {
     }
 }
 
-/// Exact dependency identity captured by one fiber epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DependencyEpoch {
-    ordinal: u64,
+/// Exact provider bindings captured by one fiber.
+///
+/// This is deliberately independent from lifecycle transition identity. A
+/// notification that observes the same providers is therefore neutral, while
+/// a replacement with an equal value still produces a different binding.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DependencyBinding {
     pins: BTreeMap<CapabilityId, DependencyPin>,
 }
 
@@ -225,8 +228,22 @@ pub struct DependencyPin {
     entry_id: crate::EntryId,
 }
 
-impl DependencyEpoch {
-    fn from_dependencies(ordinal: u64, dependencies: &ResolvedDependencies) -> Self {
+impl DependencyPin {
+    /// Returns the exact publication generation.
+    #[must_use]
+    pub const fn generation(self) -> Generation {
+        self.generation
+    }
+
+    /// Returns the exact runtime entry identity.
+    #[must_use]
+    pub const fn entry_id(self) -> crate::EntryId {
+        self.entry_id
+    }
+}
+
+impl DependencyBinding {
+    fn from_dependencies(dependencies: &ResolvedDependencies) -> Self {
         let pins = dependencies
             .iter()
             .map(|(id, handle)| {
@@ -239,13 +256,13 @@ impl DependencyEpoch {
                 )
             })
             .collect();
-        Self { ordinal, pins }
+        Self { pins }
     }
 
-    /// Returns the monotonic lifecycle epoch number.
+    /// Returns the exact provider pin for a dependency.
     #[must_use]
-    pub const fn ordinal(&self) -> u64 {
-        self.ordinal
+    pub fn pin(&self, id: &CapabilityId) -> Option<DependencyPin> {
+        self.pins.get(id).copied()
     }
 
     /// Returns the exact generation pinned for a dependency.
@@ -260,10 +277,71 @@ impl DependencyEpoch {
         self.pins.get(id).map(|pin| pin.entry_id)
     }
 
+    /// Returns exact provider pins in deterministic identifier order.
+    pub fn iter(&self) -> impl Iterator<Item = (&CapabilityId, DependencyPin)> {
+        self.pins.iter().map(|(id, pin)| (id, *pin))
+    }
+
     /// Returns whether this epoch has no dependencies.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
+    }
+}
+
+/// A dependency binding plus the monotonic token for one lifecycle request.
+///
+/// The token is a race/transition identity only. Binding comparisons must use
+/// [`Self::binding`], never the whole epoch, when deciding whether a provider
+/// actually changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyEpoch {
+    transition_token: u64,
+    binding: DependencyBinding,
+}
+
+impl DependencyEpoch {
+    fn from_dependencies(transition_token: u64, dependencies: &ResolvedDependencies) -> Self {
+        Self {
+            transition_token,
+            binding: DependencyBinding::from_dependencies(dependencies),
+        }
+    }
+
+    /// Returns the monotonic lifecycle transition token.
+    #[must_use]
+    pub const fn transition_token(&self) -> u64 {
+        self.transition_token
+    }
+
+    /// Returns the exact provider binding identity.
+    #[must_use]
+    pub const fn binding(&self) -> &DependencyBinding {
+        &self.binding
+    }
+
+    /// Backwards-compatible name for the transition token.
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.transition_token
+    }
+
+    /// Returns the exact generation pinned for a dependency.
+    #[must_use]
+    pub fn generation(&self, id: &CapabilityId) -> Option<Generation> {
+        self.binding.generation(id)
+    }
+
+    /// Returns the exact entry identity pinned for a dependency.
+    #[must_use]
+    pub fn entry_id(&self, id: &CapabilityId) -> Option<crate::EntryId> {
+        self.binding.entry_id(id)
+    }
+
+    /// Returns whether this epoch has no dependencies.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.binding.is_empty()
     }
 }
 
@@ -322,8 +400,9 @@ impl PluginDefinition {
 pub struct PluginRuntime {
     definition: Arc<PluginDefinition>,
     fibers: Mutex<BTreeMap<FiberId, Arc<CapabilityFiber>>>,
-    next_fiber: AtomicU64,
 }
+
+static NEXT_FIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 impl fmt::Debug for PluginRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -341,7 +420,6 @@ impl PluginRuntime {
         Arc::new(Self {
             definition: Arc::new(definition),
             fibers: Mutex::new(BTreeMap::new()),
-            next_fiber: AtomicU64::new(1),
         })
     }
 
@@ -375,8 +453,7 @@ impl PluginRuntime {
             plugin: self.id().clone(),
             reason,
         })?;
-        let raw_id = self
-            .next_fiber
+        let raw_id = NEXT_FIBER_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
@@ -645,6 +722,7 @@ pub struct CapabilityFiber {
     transition: AsyncMutex<()>,
     handle: AsyncMutex<Option<CapabilityHandle>>,
     dependency_epoch: AsyncMutex<Option<DependencyEpoch>>,
+    loading_binding: AsyncMutex<Option<DependencyBinding>>,
     effects: Mutex<EffectScope>,
     last_cleanup_errors: AsyncMutex<Vec<EffectError>>,
     error: AsyncMutex<Option<String>>,
@@ -681,6 +759,7 @@ impl CapabilityFiber {
             transition: AsyncMutex::new(()),
             handle: AsyncMutex::new(None),
             dependency_epoch: AsyncMutex::new(None),
+            loading_binding: AsyncMutex::new(None),
             effects: Mutex::new(EffectScope::new()),
             last_cleanup_errors: AsyncMutex::new(Vec::new()),
             error: AsyncMutex::new(None),
@@ -732,6 +811,49 @@ impl CapabilityFiber {
         self.dependency_epoch.lock().await.clone()
     }
 
+    /// Returns the exact dependency binding committed by the active fiber.
+    #[must_use]
+    pub async fn dependency_binding(&self) -> Option<DependencyBinding> {
+        self.dependency_epoch
+            .lock()
+            .await
+            .as_ref()
+            .map(|epoch| epoch.binding().clone())
+    }
+
+    /// Returns whether this fiber declares a dependency on the capability.
+    #[must_use]
+    pub fn declares_dependency(&self, capability: &CapabilityId) -> bool {
+        self.definition
+            .capability
+            .dependencies
+            .iter()
+            .any(|dependency| &dependency.id == capability)
+    }
+
+    /// Returns the exact provider binding currently being loaded, if any.
+    pub(crate) async fn loading_binding(&self) -> Option<DependencyBinding> {
+        self.loading_binding.lock().await.clone()
+    }
+
+    /// Deactivates this fiber as part of a provider withdrawal.
+    ///
+    /// The transition lock makes the return a quiescence boundary. Effects
+    /// run before the committed handle is released, so cleanup can still use
+    /// the exact dependency snapshot that activated the fiber.
+    pub async fn deactivate_for_withdrawal(&self) -> Result<FiberState, FiberError> {
+        self.requested_epoch.fetch_add(1, Ordering::AcqRel);
+        let _transition = self.transition.lock().await;
+        if self.state() == FiberState::Disposed {
+            return Ok(FiberState::Disposed);
+        }
+        if matches!(self.state(), FiberState::Active | FiberState::Failed) {
+            let errors = self.unload().await;
+            *self.last_cleanup_errors.lock().await = errors;
+        }
+        Ok(self.state())
+    }
+
     /// Registers an effect while the fiber is active.
     pub fn effect(&self, effect: ScopedEffect) -> Result<(), FiberError> {
         let effects = self.effects.lock().expect("fiber effect lock poisoned");
@@ -740,6 +862,23 @@ impl CapabilityFiber {
             return Err(FiberError::InactiveEffect(state));
         }
         effects.register(effect).map_err(FiberError::Effect)
+    }
+
+    pub(crate) async fn needs_reconciliation(&self) -> bool {
+        let current = self
+            .context
+            .resolve_dependencies(&self.definition.capability)
+            .ok()
+            .map(|dependencies| DependencyBinding::from_dependencies(&dependencies));
+        match self.state() {
+            FiberState::Active => current != self.dependency_binding().await,
+            FiberState::Loading => current != self.loading_binding().await,
+            FiberState::Pending => {
+                !self.definition.capability.dependencies.is_empty() && current.is_some()
+            }
+            FiberState::Failed | FiberState::Disposed => false,
+            FiberState::Unloading => true,
+        }
     }
 
     /// Marks a possible dependency change. The next stable operation observes
@@ -821,7 +960,8 @@ impl CapabilityFiber {
                 cleanup_errors: self.cleanup_errors().await,
             });
         }
-        let force = force || self.force_reload.swap(false, Ordering::AcqRel);
+        let requested_force = self.force_reload.swap(false, Ordering::AcqRel);
+        let force = force || requested_force;
 
         loop {
             let dependencies = match self
@@ -842,11 +982,12 @@ impl CapabilityFiber {
             );
 
             let active_matches = if !force && self.state() == FiberState::Active {
-                self.dependency_epoch().await.as_ref() == Some(&epoch)
+                self.dependency_binding().await.as_ref() == Some(&epoch.binding)
             } else {
                 false
             };
             if active_matches {
+                *self.dependency_epoch.lock().await = Some(epoch);
                 return Ok(FiberState::Active);
             }
 
@@ -865,7 +1006,6 @@ impl CapabilityFiber {
             }
 
             self.set_state(FiberState::Loading);
-            let token = self.requested_epoch.load(Ordering::Acquire);
             let config = self
                 .context
                 .intercepted_config(self.plugin_id())
@@ -878,6 +1018,7 @@ impl CapabilityFiber {
             let effects = EffectScope::new();
             *self.effects.lock().expect("fiber effect lock poisoned") = effects.clone();
             *self.error.lock().await = None;
+            *self.loading_binding.lock().await = Some(epoch.binding.clone());
             let load_context = PluginLoadContext::new(
                 self.context.clone(),
                 config,
@@ -889,13 +1030,13 @@ impl CapabilityFiber {
             let current_dependencies = self
                 .context
                 .resolve_dependencies(&self.definition.capability);
+            let current_binding = current_dependencies
+                .as_ref()
+                .ok()
+                .map(DependencyBinding::from_dependencies);
             let stale = self.dispose_requested.load(Ordering::Acquire)
-                || self.requested_epoch.load(Ordering::Acquire) != token
-                || current_dependencies
-                    .as_ref()
-                    .ok()
-                    .map(|current| DependencyEpoch::from_dependencies(token, current) != epoch)
-                    != Some(false);
+                || self.force_reload.load(Ordering::Acquire)
+                || current_binding.as_ref() != Some(&epoch.binding);
             match result {
                 Ok(value) if !stale => {
                     match self.context.scope().provide_value(
@@ -905,17 +1046,24 @@ impl CapabilityFiber {
                     ) {
                         Ok(handle) => {
                             *self.handle.lock().await = Some(handle);
-                            *self.dependency_epoch.lock().await = Some(epoch);
+                            *self.dependency_epoch.lock().await =
+                                Some(DependencyEpoch::from_dependencies(
+                                    self.requested_epoch.load(Ordering::Acquire),
+                                    &dependencies,
+                                ));
+                            *self.loading_binding.lock().await = None;
                             self.set_state(FiberState::Active);
                             return Ok(FiberState::Active);
                         }
                         Err(ScopeError::DependencyChanged { .. }) => {
                             let errors = effects.dispose_all().await;
                             *self.last_cleanup_errors.lock().await = errors;
+                            *self.loading_binding.lock().await = None;
                             self.set_state(FiberState::Pending);
                         }
                         Err(error) => {
                             let errors = effects.dispose_all().await;
+                            *self.loading_binding.lock().await = None;
                             *self.error.lock().await = Some(error.to_string());
                             *self.last_cleanup_errors.lock().await = errors.clone();
                             self.set_state(FiberState::Failed);
@@ -926,6 +1074,8 @@ impl CapabilityFiber {
                 Ok(value) => {
                     drop(value);
                     let errors = effects.dispose_all().await;
+                    *self.loading_binding.lock().await = None;
+                    self.force_reload.store(false, Ordering::Release);
                     *self.last_cleanup_errors.lock().await = errors;
                     if self.dispose_requested.load(Ordering::Acquire) {
                         return Err(FiberError::Disposed);
@@ -934,6 +1084,8 @@ impl CapabilityFiber {
                 }
                 Err(_) if stale => {
                     let errors = effects.dispose_all().await;
+                    *self.loading_binding.lock().await = None;
+                    self.force_reload.store(false, Ordering::Release);
                     *self.error.lock().await = None;
                     *self.last_cleanup_errors.lock().await = errors;
                     if self.dispose_requested.load(Ordering::Acquire) {
@@ -944,6 +1096,7 @@ impl CapabilityFiber {
                 }
                 Err(reason) => {
                     let errors = effects.dispose_all().await;
+                    *self.loading_binding.lock().await = None;
                     *self.error.lock().await = Some(reason.clone());
                     *self.last_cleanup_errors.lock().await = errors.clone();
                     self.set_state(FiberState::Failed);
@@ -983,6 +1136,7 @@ impl CapabilityFiber {
             }
         }
         *self.dependency_epoch.lock().await = None;
+        *self.loading_binding.lock().await = None;
         *self.effects.lock().expect("fiber effect lock poisoned") = EffectScope::new();
         self.set_state(FiberState::Pending);
         errors

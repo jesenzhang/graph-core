@@ -333,6 +333,20 @@ impl Scope {
         self.state.parent.as_ref()?.get(id)
     }
 
+    /// Looks up only a capability published directly by this scope.
+    #[must_use]
+    pub fn get_local(&self, id: &CapabilityId) -> Option<CapabilityHandle> {
+        if !self.is_open() {
+            return None;
+        }
+        self.state
+            .entries
+            .read()
+            .expect("scope entry lock poisoned")
+            .get(id)
+            .map(CapabilityEntry::handle)
+    }
+
     /// Returns the generation of the nearest visible entry.
     #[must_use]
     pub fn generation(&self, id: &CapabilityId) -> Option<Generation> {
@@ -447,6 +461,16 @@ impl Scope {
         capability: &CapabilityId,
         expected_generation: Generation,
     ) -> Result<(), ScopeError> {
+        self.withdraw(capability, expected_generation).map(drop)
+    }
+
+    /// Withdraws one exact local publication and returns a guard retaining its
+    /// value until the caller finishes dependent teardown.
+    pub fn withdraw(
+        &self,
+        capability: &CapabilityId,
+        expected_generation: Generation,
+    ) -> Result<CapabilityHandle, ScopeError> {
         let old = {
             let _topology = self
                 .state
@@ -475,8 +499,10 @@ impl Scope {
             }
             entries.remove(capability)
         };
+        let old = old.expect("checked local entry must exist");
+        let handle = old.handle();
         drop(old);
-        Ok(())
+        Ok(handle)
     }
 
     fn publish<F>(

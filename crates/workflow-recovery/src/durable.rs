@@ -206,7 +206,11 @@ impl CommitRequest {
 /// Result of a durable commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommitResult {
-    /// Revision after the request was first committed.
+    /// Current durable revision after applying or replaying the request.
+    ///
+    /// An idempotent replay does not mutate state. Its revision is therefore
+    /// the current store head, rather than the revision at which the key was
+    /// first committed.
     pub revision: StoreRevision,
     /// Whether this result came from an idempotent replay.
     pub replayed: bool,
@@ -563,10 +567,10 @@ impl DurableStore for InMemoryDurableStore {
             .get_mut(&request.run_id)
             .ok_or_else(|| StoreError::RunNotFound(request.run_id.clone()))?;
 
-        if let Some((existing, revision)) = state.idempotency.get(&request.idempotency_key) {
+        if let Some((existing, _revision)) = state.idempotency.get(&request.idempotency_key) {
             if existing == &request.mutations {
                 return Ok(CommitResult {
-                    revision: *revision,
+                    revision: state.revision,
                     replayed: true,
                 });
             }
