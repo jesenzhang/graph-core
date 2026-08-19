@@ -33,7 +33,7 @@ persistence adapter not started
   metatheory; distributed propagation, durable fiber replay, and concurrent
   multi-writer ordering remain out of scope.
 
-This matrix freezes the reference used for the semantic port. 鈥淧ORT鈥?means
+This matrix freezes the reference used for the semantic port. “PORT” means
 the behavioral invariant is implemented in Rust with an explicit Rust API;
 it does not mean the TypeScript API shape is copied.
 
@@ -43,7 +43,7 @@ The original M2-A port was source-driven. The later Cordis paper,
 *A Programming Paradigm for Spatiotemporal Composability*, was cross-checked
 against the same upstream Cordis commit on 2026-08-18. The detailed record is
 [`CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md`](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md)
-([涓枃](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.zh.md)).
+([中文](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.zh.md)).
 
 The paper does **not** invalidate the M2-A acceptance result, but it narrows
 what M2-A proves:
@@ -279,7 +279,7 @@ a dispatched external operation.
 
 1. Existing `capability-graph` graph validation and `Scope` ownership stay;
    they are extended with runtime modules, not replaced.
-2. The crate evolves from 鈥済raph only鈥?to 鈥済raph plus capability runtime鈥?
+2. The crate evolves from “graph only” to “graph plus capability runtime”
    while `CapabilityGraph` remains a topology/resolution type and lifecycle
    authority remains in runtime types.
 3. No new crate is required for M2-A. The existing crate owns the capability
