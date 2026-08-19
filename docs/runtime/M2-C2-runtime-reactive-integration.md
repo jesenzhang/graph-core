@@ -1,7 +1,7 @@
 # M2-C2 Runtime Reactive Integration
 
-Status: implemented on `feat/m2-c2-runtime-reactive-boundary`; base
-`589827af0156fa0d3f25f5bb6f4044f2be61b527`
+Status: Integrated / Closed on `main`
+`60066dcfb7d7038d64da441f3ee852893fbd9119`
 
 M2-C2 composes the existing M1 task admission, M2-B durable recovery, and
 M2-C1 reactive lifecycle under one Runtime Core boundary. It does not add a

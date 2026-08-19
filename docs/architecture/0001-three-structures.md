@@ -9,7 +9,8 @@ Agent systems often describe plugin dependencies, task orchestration, event flow
 
 ## Decision
 
-`graph-core` starts with three independent structures:
+Kernis, originally named `graph-core`, starts with three independent
+structures:
 
 - Capability Graph;
 - Workflow Graph / DAG;

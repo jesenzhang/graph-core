@@ -33,7 +33,7 @@ persistence adapter not started
   metatheory; distributed propagation, durable fiber replay, and concurrent
   multi-writer ordering remain out of scope.
 
-This matrix freezes the reference used for the semantic port. “PORT” means
+This matrix freezes the reference used for the semantic port. 鈥淧ORT鈥?means
 the behavioral invariant is implemented in Rust with an explicit Rust API;
 it does not mean the TypeScript API shape is copied.
 
@@ -43,7 +43,7 @@ The original M2-A port was source-driven. The later Cordis paper,
 *A Programming Paradigm for Spatiotemporal Composability*, was cross-checked
 against the same upstream Cordis commit on 2026-08-18. The detailed record is
 [`CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md`](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.md)
-([中文](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.zh.md)).
+([涓枃](CORDIS-PAPER-IMPLEMENTATION-DEEP-DIVE.zh.md)).
 
 The paper does **not** invalidate the M2-A acceptance result, but it narrows
 what M2-A proves:
@@ -68,13 +68,13 @@ what M2-A proves:
    and reconciliation remain separate and higher-priority authorities.
 5. The paper's global temporal-composability results depend on witnessed
    inverses, observational equivalence, and independence assumptions that
-   graph-core does not currently model. No full Cordis metatheory is claimed
+   Kernis does not currently model. No full Cordis metatheory is claimed
    for M2-A.
 
 One source-level correction is also frozen here: a single Cordis `ctx.effect`
 composes yielded/nested disposers in strict LIFO order, but current
 `Fiber._unload()` obtains top-level disposables in reverse order and starts
-those sibling cleanups with `Promise.all(...)`. graph-core's `EffectStack`
+those sibling cleanups with `Promise.all(...)`. Kernis's `EffectStack`
 intentionally uses stricter sequential reverse-order cleanup. That is a
 conservative Rust adaptation, not an incompatibility.
 
@@ -107,7 +107,7 @@ compatibility rule.
 
 ## Summary matrix
 
-| Cordis | graph-core Rust | Strategy | Status |
+| Cordis | Kernis Rust | Strategy | Status |
 |---|---|---|---|
 | Context | `CapabilityContext` / `Scope` | PORT | implemented |
 | `extend` | `child_context` / child scope | PORT | implemented |
@@ -221,7 +221,7 @@ each disposer sequentially in reverse registration order. Cleanup continues
 after errors. `Drop` only releases Rust-owned memory; explicit disposal remains
 the authority for process-local external resources.
 
-Neither Cordis nor graph-core proves that a developer-supplied disposer is a
+Neither Cordis nor Kernis proves that a developer-supplied disposer is a
 correct semantic inverse. That remains a component contract and must be
 validated with effect-specific tests.
 
@@ -238,7 +238,7 @@ committed to it, while those consumers retain access to their committed
 binding during teardown. Provider recovery runs only after those dependents
 have quiesced.
 
-graph-core currently has two related but distinct mechanisms, with M2-C1 adding
+Kernis currently has two related but distinct mechanisms, with M2-C1 adding
 the live coordinator protocol:
 
 - `Scope::teardown()` stops new lookup/mutation and releases local ownership in
@@ -270,7 +270,7 @@ fit a revertible effect; an externally observed send, payment, or other
 non-idempotent mutation cannot be made as-if-never-happened by a disposer.
 Withholding/output commit or application-level compensation is required.
 
-This reinforces graph-core's existing authority split: `ScopedEffect` owns
+This reinforces Kernis's existing authority split: `ScopedEffect` owns
 process-local cleanup; `DurableJournal` owns operation intent, dispatch,
 outcome and reconciliation truth. Capability teardown must never reinterpret
 a dispatched external operation.
@@ -279,7 +279,7 @@ a dispatched external operation.
 
 1. Existing `capability-graph` graph validation and `Scope` ownership stay;
    they are extended with runtime modules, not replaced.
-2. The crate evolves from “graph only” to “graph plus capability runtime”,
+2. The crate evolves from 鈥済raph only鈥?to 鈥済raph plus capability runtime鈥?
    while `CapabilityGraph` remains a topology/resolution type and lifecycle
    authority remains in runtime types.
 3. No new crate is required for M2-A. The existing crate owns the capability

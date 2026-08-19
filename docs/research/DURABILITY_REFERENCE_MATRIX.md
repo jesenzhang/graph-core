@@ -32,7 +32,7 @@ retry is recovery.
 `PORT`, `ADAPT`, `GAP`, `DEFER`, and `REJECT` are the only strategy statuses in
 this matrix.
 
-| Concern | Reference | Mechanism | graph-core strategy |
+| Concern | Reference | Mechanism | Kernis strategy |
 | --- | --- | --- | --- |
 | intent before effect | Temporal history/mutable state; Durable Task orchestration actions | Commit the logical command/history fact before a worker performs the external action | ADAPT |
 | dispatch identity | Temporal scheduled/started event IDs; Restate invocation journal entry index | Separate logical operation identity from each dispatch attempt and persist the latest dispatch identity | PORT |
@@ -62,7 +62,7 @@ this matrix.
 
 ## Identity mapping
 
-| Durable/runtime identity | graph-core meaning | Rule |
+| Durable/runtime identity | Kernis meaning | Rule |
 | --- | --- | --- |
 | `RunId` | One workflow execution | Stable across task attempts in one run. |
 | `TaskId` | Logical workflow node/task | Owned by `WorkflowGraph`; not an attempt identity. |

@@ -1,87 +1,150 @@
-# graph-core
+# Kernis
 
-`graph-core` is a small Rust workspace that first validated, and now runs, three different kinds of graph-shaped runtime structure that are often incorrectly collapsed into one abstraction:
+A Rust Meta-Runtime Kernel
 
-1. **Capability Graph** — what capabilities/services/plugins exist and depend on each other.
-2. **Workflow Graph / DAG** — how a task is decomposed, ordered, retried, resumed, and completed.
-3. **Execution Streams** — high-frequency ordered runtime data such as model deltas, tool output, events, and progress. These are intentionally modeled as typed streams, not as a mutable general-purpose graph.
+## What Kernis is
 
-Research Baseline v0 is complete. M1 Runtime Core is implemented as a
-synchronous, single-process, deterministic coordinator over the validated
-structures. M2-A adds a process-local asynchronous Capability Runtime for
-Cordis-derived context, registry, fiber, and effect semantics. M2-B0 defines
-the durable runtime boundary and the M2-B1 in-memory durable-store/restart
-slice is implemented. M2-C1 adds an explicit reactive capability coordinator
-with fixed-point replacement and quiescent provider withdrawal. M2-C2
-integrates that coordinator as Runtime Core's single capability owner. There
-is still no concrete physical persistence adapter, provider SDK, dynamic
-plugin loader, or distributed execution.
+Kernis is a Rust meta-runtime kernel research and implementation project.
 
-## Why this exists
+It studies runtime and meta-framework systems such as Cordis, durable
+workflow runtimes, effect systems, and execution frameworks, validates their
+useful semantics through reproducible experiments, and implements the
+mechanisms that survive those experiments as a reusable runtime kernel.
 
-The original `workflow_engine` direction grew from a ComfyUI/Dify-like DAG workflow system toward Agent-controlled dynamic workflows. More recent harness/runtime designs suggest that capability composition, task orchestration, and high-frequency execution data have different lifecycles and should not be forced into one graph model.
+Its long-term goal is to evolve that kernel into a composable meta-framework
+for building dynamic, reactive, durable runtimes.
 
-`graph-core` exists to validate that separation experimentally before committing to a production architecture.
+Kernis is not a Cordis clone and not a generic graph framework. Research is
+the method; implementation is the outcome.
+
+## Why it exists
+
+Runtime systems often collapse capability composition, workflow orchestration,
+and execution data into one abstraction. Kernis keeps these concerns separate
+so that ownership, mutation, lifecycle, recovery, and observation semantics
+can be tested independently before they become reusable kernel contracts.
+
+## Architecture
+
+Kernis preserves three independent semantic structures:
+
+### Capability Runtime
+
+Capability composition owns scopes, exact provider identity, dependency
+resolution, process-local fibers, replacement, withdrawal, and effect cleanup.
+
+### Workflow Runtime
+
+Workflow orchestration owns task topology, dependencies, readiness, mutation,
+completion, and deterministic task admission.
+
+### Execution Streams
+
+Execution Streams own ordered, bounded observations such as lifecycle events,
+progress, telemetry, and high-frequency output. Stream loss is not recovery
+authority.
+
+### Durable Authority
+
+DurableStore/DurableJournal own effect intent, dispatch, outcome, cancellation,
+operation/attempt lineage, and replay identity. Durable facts are kept
+separate from process-local fibers and live capability handles.
+
+### Runtime Core
+
+Runtime Core coordinates these authorities without owning all of their truth.
+`Runtime` remains a synchronous deterministic task-admission boundary and
+owns one process-local `ReactiveCapabilityRuntime`. Reactive mutation crosses
+an explicit async reconciliation boundary before it affects a new admission.
+
+No shared public `Graph` trait or generic dynamic graph runtime is used to
+unify these domains.
+
+## Research methodology
+
+Kernis follows this loop:
+
+```text
+Research
+  -> validate semantics
+  -> implement kernel mechanism
+  -> stabilize reusable boundary
+  -> evolve toward meta-framework
+```
+
+Experiments can reject an abstraction, but research exists in service of
+implementation rather than as an endpoint separate from the kernel.
+
+## Cordis and other references
+
+Cordis is a primary research reference for capability composition, contextual
+dependency injection, lifecycle, reactive replacement, plugin composition,
+and meta-framework semantics. Kernis does not aim to reproduce Cordis
+literally. It also draws on workflow runtime research, durability/recovery
+systems, Effect/ZIO-like concepts, typed execution-stream semantics, and
+future validated references.
+
+## Current implementation status
+
+- M1 Runtime Core: implemented and integrated.
+- M2-A Capability Runtime: integrated.
+- M2-B0: complete.
+- M2-B1: in-memory `DurableStore`/restart slice implemented; physical
+  persistence adapter not started.
+- M2-C1: Integrated / Closed at
+  `589827af0156fa0d3f25f5bb6f4044f2be61b527`.
+- M2-C2: Integrated / Closed at
+  `60066dcfb7d7038d64da441f3ee852893fbd9119`.
+
+The current implementation deliberately has no physical database durability,
+plugin loader, HMR watcher, provider SDK, WASM/dynamic-library ABI, MCP
+integration, agent loop, distributed runtime, or durable fiber serialization.
+
+## Long-term direction
+
+### Stage 1 — Research & Semantic Validation
+
+Validate the architecture and preserve the useful invariants from E01-E05,
+M1, M2-A, M2-B, M2-C1, and M2-C2.
+
+### Stage 2 — Runtime Kernel
+
+Develop the current implementation into a reusable kernel. Candidate work
+includes a physical durability adapter, runtime/plugin composition APIs,
+configuration reconstruction, error/API stabilization, an async execution
+boundary, a minimal loader boundary, and further Cordis semantic research.
+
+### Stage 3 — Meta-Framework
+
+Long-term possibilities include declarative capability/plugin composition,
+runtime configuration, plugin lifecycle, dynamic replacement, workflow
+integration, durable execution, extension APIs, and developer-facing
+framework ergonomics. These are direction, not promises of an unvalidated ABI
+or distributed design.
 
 ## Workspace
 
 ```text
 crates/
-  core/               Shared identifiers and neutral primitives only
+  core/               Neutral primitives (`kernis-core` package)
   capability-graph/   Capability/service/plugin dependency experiments
   workflow-graph/     Task DAG and orchestration experiments
   execution-stream/   Typed ordered runtime stream primitives
+  workflow-recovery/  Durable facts and recovery classification
   runtime-core/       Deterministic runtime coordination and recovery
-  graph-lab/          Small executable for experiments and examples
+  graph-lab/          Small executable for experiments and smoke checks
 
 docs/
-  architecture/       Lightweight architecture decisions
-  research/           Baseline, questions, reference notes, experiment plan
+  architecture/       Architecture decisions
+  research/           Research, references, and semantic experiments
+  runtime/            Runtime authority and milestone contracts
 ```
 
-## Baseline rules
+Domain crate names remain descriptive; the project identity is Kernis.
 
-- Do not create a `Graph` trait shared by all three domains merely for reuse.
-- Semantic invariants live in the domain crate that owns them.
-- Execution streams are not represented as graph mutations.
-- Dynamic composition does not automatically imply dynamic task topology.
-- Workflow completion and external effect facts remain authoritative in their domain crates; Runtime Core coordinates them without creating a second truth.
-- New dependencies require an experiment or a concrete implementation need.
+## Repository
 
-## M1 Runtime Core
-
-M1 composes capability pinning, workflow scheduling and mutation, effect
-intent/dispatch/outcome recovery, and non-authoritative execution streams.
-`graph-lab` includes a real smoke run. See
-[`docs/runtime/M1-runtime-core.md`](docs/runtime/M1-runtime-core.md) for the
-authority model, invariants, and current limitations.
-
-## M2-A Capability Runtime
-
-`capability-graph` now owns explicit `CapabilityContext`, `CapabilityRegistry`,
-`CapabilityFiber`, dependency epochs, and reverse-ordered `EffectStack`
-semantics. The runtime preserves exact capability generation/entry pinning for
-in-flight M1 attempts. See [`docs/research/CORDIS_PORT_MATRIX.md`](docs/research/CORDIS_PORT_MATRIX.md),
-[`docs/architecture/0003-cordis-semantic-port-decisions.md`](docs/architecture/0003-cordis-semantic-port-decisions.md),
-and [`docs/runtime/M2-B-handoff.md`](docs/runtime/M2-B-handoff.md).
-
-## M2-B durable boundary and M2-C2 runtime capability boundary
-
-M2-B0 keeps durable workflow/effect facts separate from process-local Fiber
-state. M2-B1's first slice provides a synchronous typed `DurableStore` seam,
-an `InMemoryDurableStore`, attempt admission, dispatch/outcome lineage, and
-restart reconstruction; a concrete physical persistence adapter is not
-started. M2-C1 provides explicit `ReactiveCapabilityRuntime` mutation and
-reconciliation helpers. M2-C2 makes one Runtime-owned coordinator the
-capability boundary, with compatibility accessors delegating to that same
-context and registry. A single reconciliation call reaches the latest
-transitive dependency fixpoint, and provider withdrawal drains affected
-dependents before releasing the exact retirement guard.
-
-`Runtime::step()` remains synchronous and does not reconcile reactive state.
-Callers use `capability_runtime()` for mutation, then cross the explicit async
-`reconcile()` boundary before a new task admission. Existing attempts retain
-their exact capability handles; replacement changes only future resolution.
+[github.com/jesenzhang/kernis](https://github.com/jesenzhang/kernis)
 
 ## First commands
 
@@ -91,7 +154,3 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo run -p graph-lab
 ```
-
-## Research entrypoint
-
-Start with [`docs/research/BASELINE.md`](docs/research/BASELINE.md).

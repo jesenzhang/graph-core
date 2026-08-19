@@ -128,7 +128,7 @@ merged under one generic retry API.
    state, explicit CAS errors, `Result`-based recovery classification,
    capability pin/config serialization, and separation of runtime objects from
    records.
-3. graph-core gaps: a durable store, a durable timer/lease boundary,
+3. Kernis gaps: a durable store, a durable timer/lease boundary,
    worker-execution identity, non-idempotent provider reconciliation protocol,
    and a validated retry-pending-execution API.
 4. Minimum authoritative persistent state: `RunId`, workflow revision and
